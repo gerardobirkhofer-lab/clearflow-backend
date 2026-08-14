@@ -1,0 +1,59 @@
+[tool.poetry]
+name = "clearflow-backend"
+version = "0.1.0"
+description = "Reconciliation and Cash Flow Management API"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.110.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+sqlalchemy = {extras = ["asyncpg"], version = "^2.0.0"}
+alembic = "^1.13.0"
+asyncpg = "^0.29.0"
+redis = "^5.0.0"
+celery = "^5.3.0"
+pydantic = "^2.6.0"
+pydantic-settings = "^2.1.0"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+passlib = {extras = ["bcrypt"], version = "^1.7.0"}
+python-multipart = "^0.0.9"
+httpx = "^0.26.0"
+structlog = "^24.1.0"
+python-dateutil = "^2.8.0"
+holidays = "^0.44.0"
+jinja2 = "^3.1.0"
+pillow = "^10.2.0"
+openpyxl = "^3.1.0"
+pandas = "^2.2.0"
+stripe = "^15.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+pytest-cov = "^4.1.0"
+black = "^24.1.0"
+ruff = "^0.2.0"
+mypy = "^1.8.0"
+factory-boy = "^3.3.0"
+faker = "^23.0.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+pyjwt = "^2.8.0"
+bcrypt = "^3.2.2"

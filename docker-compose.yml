@@ -1,0 +1,190 @@
+
+services:
+  # ── PostgreSQL Database ──
+  db:
+    image: postgres:15-alpine
+    container_name: clearflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: clearflow
+      POSTGRES_PASSWORD: clearflow_dev_password_2024
+      POSTGRES_DB: clearflow
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/app/migrations/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clearflow -d clearflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - clearflow-network
+
+  # ── Redis (Cache + Celery Broker) ──
+  redis:
+    image: redis:7-alpine
+    container_name: clearflow-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - clearflow-network
+
+  # ── Backend API (FastAPI) ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: clearflow-backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://clearflow:clearflow_dev_password_2024@db:5432/clearflow
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - SECRET_KEY=dev-secret-key-change-in-production
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - DEFAULT_TENANT_ID=22222222-2222-2222-2222-222222222222
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - clearflow-network
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # ── Celery Worker ──
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: clearflow-celery
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://clearflow:clearflow_dev_password_2024@db:5432/clearflow
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - SECRET_KEY=dev-secret-key-change-in-production
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      - db
+      - redis
+    networks:
+      - clearflow-network
+    command: >
+      sh -c "celery -A app.core.celery_app worker --loglevel=info --concurrency=4"
+
+  # ── Celery Beat (Scheduler) ──
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: clearflow-beat
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://clearflow:clearflow_dev_password_2024@db:5432/clearflow
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - SECRET_KEY=dev-secret-key-change-in-production
+      - ENVIRONMENT=development
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    depends_on:
+      - db
+      - redis
+    networks:
+      - clearflow-network
+    command: >
+      sh -c "celery -A app.core.celery_app beat --loglevel=info"
+
+  # ── Frontend (React) ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: clearflow-frontend
+    restart: unless-stopped
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_ENV=development
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - clearflow-network
+    command: npm run dev
+
+  # ── MinIO (S3-compatible file storage for dev) ──
+  minio:
+    image: minio/minio:latest
+    container_name: clearflow-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: clearflow
+      MINIO_ROOT_PASSWORD: clearflow_minio_dev_2024
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    networks:
+      - clearflow-network
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Mailpit (Email testing for dev) ──
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: clearflow-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # Web UI
+    networks:
+      - clearflow-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  uploads_data:
+  minio_data:
+
+networks:
+  clearflow-network:
+    driver: bridge
