@@ -1,3 +1,4 @@
+import os
 """
 FastAPI application entry point.
 Includes all routers, middleware, exception handlers, and app factory.
@@ -71,14 +72,19 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if True else None,
         lifespan=lifespan,
     )
- # CORS
+    # CORS
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    allow_origins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://clearflow-demo.vercel.app",
+    ]
+    if frontend_url and frontend_url not in allow_origins:
+        allow_origins.append(frontend_url)
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:3000",
-            "http://localhost:5173",
-            "https://clearflow-demo.vercel.app",
-        ],
+        allow_origins=allow_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
