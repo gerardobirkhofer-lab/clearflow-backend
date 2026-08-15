@@ -129,7 +129,7 @@ def create_app() -> FastAPI:
         return {"status": "healthy", "version": "1.0.0"}
 
     # Include all API routers
-    app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
+    app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(tenants.router, prefix="/api/v1", tags=["tenants"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
