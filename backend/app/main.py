@@ -1,9 +1,9 @@
-import os
 """
 FastAPI application entry point.
 Includes all routers, middleware, exception handlers, and app factory.
 """
 from __future__ import annotations
+import os
 
 import uuid
 
