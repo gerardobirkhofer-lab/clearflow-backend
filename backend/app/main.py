@@ -130,7 +130,7 @@ def create_app() -> FastAPI:
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
-    app.include_router(tenants.router, prefix="/api/v1", tags=["tenants"])
+    app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
     app.include_router(bank_statements.router, prefix="/api/v1", tags=["bank-statements"])
