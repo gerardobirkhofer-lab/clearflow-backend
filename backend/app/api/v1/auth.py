@@ -6,12 +6,13 @@ from datetime import datetime, timedelta, timezone
 import jwt
 import hashlib
 import secrets
+import os
 
 from app.core.database import get_db
 from app.models.user import User
 
 router = APIRouter()
-SECRET_KEY = "clearflow-secret-key-change-in-production"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clearflow-secret-key-change-in-production")
 ALGORITHM = "HS256"
 security = HTTPBearer()
 
