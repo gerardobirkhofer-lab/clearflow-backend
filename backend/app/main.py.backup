@@ -25,8 +25,6 @@ from .api.v1 import (
     institutions,
     collections,
     bank_statements,
-    providers,
-    disputes,
     tpv_reports,
     fee_structures,
     reconciliation,
@@ -135,12 +133,10 @@ def create_app() -> FastAPI:
     app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
-    app.include_router(bank_statements.router, prefix="/api/v1/bank-statements", tags=["bank-statements"])
-    app.include_router(providers.router, prefix="/api/v1/providers", tags=["providers"])
-    app.include_router(disputes.router, prefix="/api/v1/disputes", tags=["disputes"])
+    app.include_router(bank_statements.router, prefix="/api/v1", tags=["bank-statements"])
     app.include_router(tpv_reports.router, prefix="/api/v1", tags=["tpv-reports"])
     app.include_router(fee_structures.router, prefix="/api/v1", tags=["fee-structures"])
-    app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["reconciliation"])
+    app.include_router(reconciliation.router, prefix="/api/v1", tags=["reconciliation"])
     app.include_router(cash_flow.router, prefix="/api/v1", tags=["cash-flow"])
     app.include_router(morning_reports.router, prefix="/api/v1", tags=["morning-reports"])
     app.include_router(uploads.router, prefix="/api/v1", tags=["uploads"])
