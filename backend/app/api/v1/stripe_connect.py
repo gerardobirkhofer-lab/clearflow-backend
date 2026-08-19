@@ -36,7 +36,6 @@ async def stripe_callback(code: str, state: str, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=500, detail="Stripe not configured")
     tenant_id = uuid.UUID(state)
     try:
-    try:
         response = stripe.oauth.token(grant_type="authorization_code", code=code)
         stripe_user_id = response.get("stripe_user_id")
         access_token = response.get("access_token")
