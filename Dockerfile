@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy backend code
 COPY backend/pyproject.toml backend/poetry.lock* ./
-RUN pip install poetry && \
+RUN pip install poetry psycopg2-binary && \
     poetry config virtualenvs.create false && \
     poetry install --only main --no-interaction --no-ansi --no-root
 
