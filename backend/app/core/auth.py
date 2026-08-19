@@ -27,7 +27,7 @@ async def get_current_user(
     return CurrentUser(
         id=UUID("11111111-1111-1111-1111-111111111111"),
         email="dev@clearflow.local",
-        tenant_id=UUID(os.getenv("DEFAULT_TENANT_ID", "22222222-2222-2222-2222-222222222222")),
+        tenant_id=UUID(os.getenv("DEFAULT_TENANT_ID", "abdebf06-ae2e-4565-8111-162092005abc")),
         role="OWNER",
     )
 
