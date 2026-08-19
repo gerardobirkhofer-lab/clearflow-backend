@@ -87,6 +87,7 @@ def create_app() -> FastAPI:
         "http://localhost:3000",
         "http://localhost:5173",
         "https://clearflow-demo.vercel.app",
+        "https://clearflow-frontend-rust.vercel.app",
     ]
     if frontend_url and frontend_url not in allow_origins:
         allow_origins.append(frontend_url)
