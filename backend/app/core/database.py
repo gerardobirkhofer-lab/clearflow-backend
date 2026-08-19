@@ -25,9 +25,19 @@ from .auth import get_current_user, CurrentUser
 
 settings = get_settings()
 
+
+def _async_url(url: str) -> str:
+    """Render gives postgres:// or postgresql://; asyncpg needs postgresql+asyncpg://."""
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql://") and "+asyncpg" not in url:
+        return url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return url
+
+
 # ── Shared (meta) engine ──────────────────────────────────────────────────────
 shared_engine = create_async_engine(
-    settings.DATABASE_URL,
+    _async_url(settings.DATABASE_URL),
     echo=settings.DEBUG,
     future=True,
 )
@@ -90,7 +100,7 @@ class TenantDBManager:
         else:
             # Pro / Enterprise → dedicated DB
             engine = create_async_engine(
-                db_url,
+                _async_url(db_url),
                 echo=settings.DEBUG,
                 future=True,
                 pool_pre_ping=True,
