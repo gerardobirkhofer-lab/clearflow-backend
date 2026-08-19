@@ -15,6 +15,8 @@ RUN pip install poetry && \
     poetry config virtualenvs.create false && \
     poetry install --only main --no-interaction --no-ansi --no-root
 
+ARG DEPLOY_TIMESTAMP=2026-08-19-v3
+
 # Application code
 COPY . .
 
