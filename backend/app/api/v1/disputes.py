@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+import uuid  from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, case
 from datetime import datetime, timedelta
@@ -12,7 +12,7 @@ router = APIRouter()
 
 @router.get("/")
 async def list_disputes(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     status: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     days_min: Optional[int] = Query(None),
@@ -57,7 +57,7 @@ async def list_disputes(
     }
 
 @router.get("/summary")
-async def get_dispute_summary(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def get_dispute_summary(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     # Total disputes
     total_result = await db.execute(
         select(func.count(Dispute.id)).where(Dispute.tenant_id == tenant_id)
@@ -174,7 +174,7 @@ async def get_dispute_summary(tenant_id: int, db: AsyncSession = Depends(get_db)
 
 @router.post("/", status_code=201)
 async def create_dispute(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     provider_name: str,
     dispute_type: str,
     amount: float,

@@ -1,4 +1,4 @@
-import os
+import uuid  import os
 import stripe
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
@@ -18,7 +18,7 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 
 @router.get("/connect-url")
-async def get_stripe_connect_url(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def get_stripe_connect_url(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     if not STRIPE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Stripe not configured")
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
@@ -66,7 +66,7 @@ async def stripe_callback(code: str, state: str, db: AsyncSession = Depends(get_
 
 
 @router.get("/status/{tenant_id}")
-async def get_stripe_status(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def get_stripe_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(ProviderConnection).where(
         ProviderConnection.tenant_id == tenant_id,
         ProviderConnection.provider_name == "stripe"
@@ -214,7 +214,7 @@ async def sync_recent_payouts(account_id: str):
 
 
 @router.post("/sync/{tenant_id}")
-async def manual_sync(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def manual_sync(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     """Manually trigger a sync for a tenant's Stripe account."""
     result = await db.execute(select(ProviderConnection).where(
         ProviderConnection.tenant_id == tenant_id,

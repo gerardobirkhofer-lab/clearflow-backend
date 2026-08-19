@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
+import uuid  from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import csv
@@ -14,7 +14,7 @@ router = APIRouter()
 @router.post("/upload")
 async def upload_provider_report(
     file: UploadFile = File(...),
-    tenant_id: int = Form(...),
+    tenant_id: uuid.UUID = Form(...),
     provider_name: str = Form(...),
     db: AsyncSession = Depends(get_db)
 ):
@@ -78,7 +78,7 @@ async def upload_provider_report(
     }
 
 @router.get("/")
-async def list_provider_transactions(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def list_provider_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(ProviderTransaction)
         .where(ProviderTransaction.tenant_id == tenant_id)

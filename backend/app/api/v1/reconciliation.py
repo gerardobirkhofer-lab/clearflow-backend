@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+import uuid  from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from datetime import timedelta
@@ -10,7 +10,7 @@ from app.models.provider_transaction import ProviderTransaction
 router = APIRouter()
 
 @router.post("/run")
-async def run_reconciliation(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def run_reconciliation(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     # Fetch all pending bank transactions
     bank_result = await db.execute(
         select(BankTransaction).where(
@@ -118,7 +118,7 @@ async def run_reconciliation(tenant_id: int, db: AsyncSession = Depends(get_db))
     }
 
 @router.get("/status")
-async def get_reconciliation_status(tenant_id: int, db: AsyncSession = Depends(get_db)):
+async def get_reconciliation_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     bank_result = await db.execute(
         select(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
     )
