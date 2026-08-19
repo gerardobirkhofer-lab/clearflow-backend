@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: clearflow-backend
+    runtime: docker
+    repo: https://github.com/gerardobirkhofer-lab/clearflow-backend
+    branch: main
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: clearflow-db
+          property: connectionString
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "false"
+      - key: ENVIRONMENT
+        value: "production"
+      - key: REDIS_URL
+        value: "redis://localhost:6379/0"
+    healthCheckPath: /health
+    autoDeploy: true
+
+  - type: web
+    name: clearflow-frontend
+    runtime: static
+    repo: https://github.com/gerardobirkhofer-lab/clearflow-frontend
+    branch: main
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_API_URL
+        value: https://clearflow-backend.onrender.com
+    autoDeploy: true
+
+databases:
+  - name: clearflow-db
+    databaseName: clearflow
+    user: clearflow
+    plan: free
