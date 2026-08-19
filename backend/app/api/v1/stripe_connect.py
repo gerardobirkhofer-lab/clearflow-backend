@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.core.database import get_db
 from app.models.provider_connection import ProviderConnection
 from app.models.provider_transaction import ProviderTransaction
-from app.models.tenant import Tenant
+from app.models_orm import Tenant
 
 router = APIRouter()
 
@@ -34,7 +34,8 @@ async def get_stripe_connect_url(tenant_id: uuid.UUID, db: AsyncSession = Depend
 async def stripe_callback(code: str, state: str, db: AsyncSession = Depends(get_db)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
-    tenant_id = int(state)
+    tenant_id = uuid.UUID(state)
+    try:
     try:
         response = stripe.oauth.token(grant_type="authorization_code", code=code)
         stripe_user_id = response.get("stripe_user_id")

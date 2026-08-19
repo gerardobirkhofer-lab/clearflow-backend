@@ -8,7 +8,7 @@ from datetime import datetime
 
 from app.core.database import get_db
 from app.models.bank_transaction import BankTransaction
-from app.models.tenant import Tenant
+from app.models_orm import Tenant
 
 router = APIRouter()
 

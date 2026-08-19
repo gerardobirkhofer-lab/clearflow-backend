@@ -1,3 +1,4 @@
+import uuid
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,7 +11,12 @@ router = APIRouter()
 
 @router.get("/dashboard")
 async def get_dashboard(
-    tenant_id: Optional[int] = None,
+    tenant_id: Optional[uuid.UUID] = None,
+    client_id: Optional[uuid.UUID] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    # --- Resolve tenant ids ---
+    tenant_ids: List[uuid.UUID] = []
     client_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
@@ -21,7 +27,7 @@ async def get_dashboard(
     if client_id:
         # Assumes your Tenant model has client_id. 
         # If you haven't added it yet, this will need the model update first.
-        from app.models.tenant import Tenant
+        from app.models_orm import Tenant
         result = await db.execute(select(Tenant).where(Tenant.client_id == client_id))
         tenants = result.scalars().all()
         tenant_ids = [t.id for t in tenants]
@@ -30,7 +36,7 @@ async def get_dashboard(
             return _empty_response()
     elif tenant_id:
         tenant_ids = [tenant_id]
-        from app.models.tenant import Tenant
+        from app.models_orm import Tenant
         t_result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
         t = t_result.scalar_one_or_none()
         if t:
