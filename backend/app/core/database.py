@@ -159,7 +159,11 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """Create all tables in the shared (meta) database on startup."""
+    """Create all tables in the shared (meta) database on startup.
+    Creates both legacy tables (auth/users) and new ORM tables."""
     from app import models_orm as orm
     async with shared_engine.begin() as conn:
+        # Legacy tables (auth system uses these)
+        await conn.run_sync(Base.metadata.create_all)
+        # New SQLAlchemy 2.0 tables
         await conn.run_sync(orm.Base.metadata.create_all)
