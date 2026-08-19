@@ -157,6 +157,20 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
     Drops existing tables first to reset schema, then recreates both
+    legacy tables (auth/users) and new ORM tables.
+
+    Order matters: legacy tables have FKs to tenants (new), so we must
+    create tenants FIRST, then legacy tables."""
+    from app import models_orm as orm
+    async with shared_engine.begin() as conn:
+        # Drop: legacy first (tables with FKs), then new (referenced tables)
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(orm.Base.metadata.drop_all)
+        # Create: new first (referenced tables like tenants), then legacy
+        await conn.run_sync(orm.Base.metadata.create_all)
+        await conn.run_sync(Base.metadata.create_all)
+    """Create all tables in the shared (meta) database on startup.
+    Drops existing tables first to reset schema, then recreates both
     legacy tables (auth/users) and new ORM tables."""
     from app import models_orm as orm
     async with shared_engine.begin() as conn:
