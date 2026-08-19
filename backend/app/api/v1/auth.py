@@ -8,7 +8,7 @@ import hashlib
 import secrets
 import os
 
-from app.core.database import get_db
+from app.core.database import get_shared_db
 from app.models.user import User
 
 router = APIRouter()
@@ -37,7 +37,7 @@ def create_token(user_id: int, email: str) -> str:
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_shared_db)
 ) -> User:
     token = credentials.credentials
     try:
@@ -57,7 +57,7 @@ async def get_current_user(
     return user
 
 @router.post("/register", status_code=201)
-async def register(data: dict, db: AsyncSession = Depends(get_db)):
+async def register(data: dict, db: AsyncSession = Depends(get_shared_db)):
     result = await db.execute(select(User).where(User.email == data.get("email")))
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -80,7 +80,7 @@ async def register(data: dict, db: AsyncSession = Depends(get_db)):
     }
 
 @router.post("/login")
-async def login(data: dict, db: AsyncSession = Depends(get_db)):
+async def login(data: dict, db: AsyncSession = Depends(get_shared_db)):
     result = await db.execute(select(User).where(User.email == data.get("email")))
     user = result.scalar_one_or_none()
     if not user or not verify_password(data.get("password"), user.password_hash):
