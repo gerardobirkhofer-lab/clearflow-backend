@@ -17,11 +17,6 @@ async def get_dashboard(
 ):
     # --- Resolve tenant ids ---
     tenant_ids: List[uuid.UUID] = []
-    client_id: Optional[int] = None,
-    db: AsyncSession = Depends(get_db)
-):
-    # --- Resolve tenant ids ---
-    tenant_ids: List[int] = []
     tenant_map = {}  # id -> name
     
     if client_id:
