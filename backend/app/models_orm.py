@@ -108,7 +108,7 @@ class TimestampMixin:
 # Core Tables
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class Tenant(Base):
+class Tenant(Base, TimestampMixin):
     """A workspace / organization. All data is scoped to a tenant."""
     __tablename__ = "tenants"
 
