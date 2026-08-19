@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import select
+from sqlalchemy import select, MetaData
 
 from .config import get_settings
 from .auth import get_current_user, CurrentUser
@@ -159,25 +159,16 @@ async def init_db() -> None:
     Drops existing tables first to reset schema, then recreates both
     legacy tables (auth/users) and new ORM tables.
 
-    Order matters: legacy tables have FKs to tenants (new), so we must
-    create tenants FIRST, then legacy tables."""
+    Legacy tables have FKs to tenants (new), so we combine both metadatas
+    into one so SQLAlchemy can resolve dependencies automatically."""
     from app import models_orm as orm
+
+    combined = MetaData()
+    for table in Base.metadata.tables.values():
+        table.tometadata(combined)
+    for table in orm.Base.metadata.tables.values():
+        table.tometadata(combined)
+
     async with shared_engine.begin() as conn:
-        # Drop: legacy first (tables with FKs), then new (referenced tables)
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(orm.Base.metadata.drop_all)
-        # Create: new first (referenced tables like tenants), then legacy
-        await conn.run_sync(orm.Base.metadata.create_all)
-        await conn.run_sync(Base.metadata.create_all)
-    """Create all tables in the shared (meta) database on startup.
-    Drops existing tables first to reset schema, then recreates both
-    legacy tables (auth/users) and new ORM tables."""
-    from app import models_orm as orm
-    async with shared_engine.begin() as conn:
-        # Drop existing tables to reset schema (e.g. UUID migration)
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(orm.Base.metadata.drop_all)
-        # Legacy tables (auth system uses these)
-        await conn.run_sync(Base.metadata.create_all)
-        # New SQLAlchemy 2.0 tables
-        await conn.run_sync(orm.Base.metadata.create_all)
+        await conn.run_sync(combined.drop_all)
+        await conn.run_sync(combined.create_all)
