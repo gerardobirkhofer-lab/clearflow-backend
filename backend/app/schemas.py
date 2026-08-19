@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from enum import Enum as PyEnum
 from typing import List, Optional
 from uuid import UUID
 
@@ -186,3 +187,45 @@ class DashboardSummaryResponse(BaseModel):
 
 class CashFlowDashboardResponse(BaseModel):
     entries: list
+
+
+# ── Tenant Schemas ──
+class TenantTier(str, PyEnum):
+    STARTER = "starter"
+    PRO = "pro"
+    ENTERPRISE = "enterprise"
+
+
+class TenantCreate(BaseModel):
+    name: str
+    slug: str
+    timezone: str = "Europe/Madrid"
+    currency: str = "EUR"
+    tier: TenantTier = TenantTier.STARTER
+
+
+class TenantUpgradeRequest(BaseModel):
+    tier: TenantTier
+    database_url: str | None = None  # Required for Pro/Enterprise
+    database_name: str | None = None
+
+
+class TenantResponse(BaseModel):
+    id: UUID
+    name: str
+    slug: str
+    timezone: str
+    currency: str
+    is_active: bool
+    subscription_plan: str
+    subscription_expires_at: datetime | None = None
+    tier: TenantTier
+    database_url: str | None = None
+    database_name: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TenantListResponse(BaseModel):
+    items: List[TenantResponse]

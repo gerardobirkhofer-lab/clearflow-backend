@@ -17,7 +17,7 @@ from fastapi.exceptions import RequestValidationError
 import structlog
 
 from .core.config import Settings, get_settings
-from .core.database import engine, init_db
+from .core.database import shared_engine, init_db
 from .core.redis import get_redis
 from .api.v1 import (
     auth,
@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     # Shutdown
     logger.info("app_shutting_down")
-    await engine.dispose()
+    await shared_engine.dispose()
 
 
 def create_app() -> FastAPI:

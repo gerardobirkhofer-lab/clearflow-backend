@@ -18,12 +18,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ENUM
 
 
-class Base(DeclarativeBase):
-    """Base class for all models."""
-    pass
+# ═══════════════════════════════════════════════════════════════════════════════
+# Enums
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class TenantTier(str, PyEnum):
+    """Subscription tier defining data isolation level."""
+    STARTER = "starter"        # Shared DB (schema isolation), up to 1,000 tx/month
+    PRO = "pro"                # Dedicated PostgreSQL DB on same cluster
+    ENTERPRISE = "enterprise"  # BYOC (Bring Your Own Cloud) or dedicated VPC
 
-# ── Enums ──
 
 class TransactionType(str, PyEnum):
     DEBIT = "debit"
@@ -68,7 +72,14 @@ class UserRole(str, PyEnum):
     VIEWER = "viewer"
 
 
-# ── Mixins ──
+# ═══════════════════════════════════════════════════════════════════════════════
+# Base & Mixins
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class Base(DeclarativeBase):
+    """Base class for all models."""
+    pass
+
 
 class TenantMixin:
     """Adds tenant_id to every table for row-level security."""
@@ -93,7 +104,9 @@ class TimestampMixin:
     )
 
 
-# ── Core Tables ──
+# ═══════════════════════════════════════════════════════════════════════════════
+# Core Tables
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class Tenant(Base):
     """A workspace / organization. All data is scoped to a tenant."""
@@ -110,8 +123,25 @@ class Tenant(Base):
     decimal_separator: Mapped[str] = mapped_column(String(1), default=",")
     thousands_separator: Mapped[str] = mapped_column(String(1), default=".")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Subscription & tiering (database-per-tenant)
     subscription_plan: Mapped[str] = mapped_column(String(20), default="free")
     subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tier: Mapped[TenantTier] = mapped_column(
+        ENUM(TenantTier, name="tenant_tier"),
+        default=TenantTier.STARTER,
+        nullable=False,
+    )
+
+    # Database isolation config
+    database_url: Mapped[str | None] = mapped_column(
+        String(500), nullable=True,
+        doc="Full asyncpg URL for Pro/Enterprise dedicated DB. NULL = shared schema."
+    )
+    database_name: Mapped[str | None] = mapped_column(
+        String(100), nullable=True,
+        doc="Logical DB name or schema name for tenant isolation."
+    )
 
     # Relationships
     users: Mapped[list["User"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
@@ -540,7 +570,9 @@ class AuditLog(Base, TenantMixin):
     tenant: Mapped["Tenant"] = relationship()
 
 
-# ── Event Listeners for Audit Log ──
+# ═══════════════════════════════════════════════════════════════════════════════
+# Event Listeners for Audit Log
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @event.listens_for(ReconciliationResult, "after_update")
 def log_reconciliation_resolution(mapper, connection, target):
