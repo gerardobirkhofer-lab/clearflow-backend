@@ -136,7 +136,7 @@ def create_app() -> FastAPI:
     # Health check
     @app.get("/health", tags=["system"])
     async def health_check():
-        return {"status": "healthy", "version": "1.0.0"}
+        return {"status": "healthy", "version": "1.0.0", "deploy": "auth-v3"}
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
