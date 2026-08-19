@@ -131,22 +131,8 @@ tenant_db_manager = TenantDBManager(shared_engine)
 async def get_db(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> AsyncGenerator[AsyncSession, None]:
-    """
-    Yield an AsyncSession routed to the correct database for the user's tenant.
-
-    * If no tenant_id is present (auth stubs, public endpoints) → shared DB.
-    * Otherwise → TenantDBManager routes to shared or dedicated engine.
-    """
-    tenant_id = current_user.tenant_id
-
-    if tenant_id is None:
-        # Public / un-tenant-scoped paths fall back to shared meta-DB
-        async with SharedSessionLocal() as session:
-            yield session
-        return
-
-    maker = await tenant_db_manager.get_session_maker(tenant_id)
-    async with maker() as session:
+    """Yield an AsyncSession from the shared DB (demo mode)."""
+    async with SharedSessionLocal() as session:
         yield session
 
 
