@@ -4,4 +4,4 @@ from .dispute import Dispute
 from .expected_collection import ExpectedCollection
 from .provider import Provider
 from .user import User
-from .tenant import Tenant
+# Tenant se importa desde models_orm para evitar duplicados

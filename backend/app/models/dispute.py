@@ -1,3 +1,4 @@
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, Enum
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -19,7 +20,7 @@ class DisputeType(str, enum.Enum):
 class Dispute(Base):
     __tablename__ = "disputes"
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     transaction_id = Column(Integer, ForeignKey("bank_transactions.id"), nullable=True)
     provider_name = Column(String(50))
     dispute_type = Column(String(30), default="missing_payout")

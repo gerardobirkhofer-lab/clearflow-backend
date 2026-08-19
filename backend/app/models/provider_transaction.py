@@ -1,3 +1,4 @@
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -6,7 +7,7 @@ class ProviderTransaction(Base):
     __tablename__ = "provider_transactions"
 
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     provider_name = Column(String(100), nullable=False)  # stripe, tpv, paypal, etc.
     filename = Column(String(255))
     concept = Column(Text)

@@ -1,3 +1,4 @@
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -5,7 +6,7 @@ from app.core.database import Base
 class BankAccount(Base):
     __tablename__ = "bank_accounts"
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     name = Column(String(100), nullable=False)
     bank_name = Column(String(100), nullable=True)
     account_number = Column(String(100), nullable=True)

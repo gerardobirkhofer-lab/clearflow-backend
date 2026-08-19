@@ -1,3 +1,4 @@
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, DateTime, JSON, ForeignKey
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -6,7 +7,7 @@ class ProviderConnection(Base):
     __tablename__ = "provider_connections"
     
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     provider_name = Column(String, nullable=False)
     account_id = Column(String, nullable=False)
     access_token = Column(String, nullable=True)

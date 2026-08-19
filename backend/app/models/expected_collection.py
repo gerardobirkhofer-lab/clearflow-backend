@@ -1,3 +1,4 @@
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -5,7 +6,7 @@ from app.core.database import Base
 class ExpectedCollection(Base):
     __tablename__ = "expected_collections"
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
     provider_id = Column(Integer, ForeignKey("providers.id"), nullable=False)
     sale_date = Column(DateTime, nullable=False)
     gross_amount = Column(Float, nullable=False)
