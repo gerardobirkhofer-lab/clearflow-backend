@@ -30,7 +30,7 @@ services:
     staticPublishPath: ./dist
     envVars:
       - key: VITE_API_URL
-        value: https://clearflow-backend.onrender.com
+        value: https://clearflow-backend-9xiq.onrender.com
     autoDeploy: true
 
 databases:
