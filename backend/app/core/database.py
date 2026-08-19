@@ -156,9 +156,13 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
-    Creates both legacy tables (auth/users) and new ORM tables."""
+    Drops existing tables first to reset schema, then recreates both
+    legacy tables (auth/users) and new ORM tables."""
     from app import models_orm as orm
     async with shared_engine.begin() as conn:
+        # Drop existing tables to reset schema (e.g. UUID migration)
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(orm.Base.metadata.drop_all)
         # Legacy tables (auth system uses these)
         await conn.run_sync(Base.metadata.create_all)
         # New SQLAlchemy 2.0 tables
