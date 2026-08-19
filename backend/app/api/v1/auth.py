@@ -1,6 +1,7 @@
 """
 Authentication endpoints with database fallback for demo resilience.
 """
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
@@ -40,7 +41,7 @@ def create_token(user_id: int, email: str) -> str:
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncSession = Depends(get_shared_db)
+    db: Optional[AsyncSession] = Depends(get_shared_db)
 ) -> User:
     token = credentials.credentials
     try:
@@ -53,6 +54,9 @@ async def get_current_user(
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    if db is None:
+        raise HTTPException(status_code=401, detail="DB unavailable")
+
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if not user:
@@ -64,7 +68,9 @@ DEMO_TOKEN = create_token(1, "demo@clearflow.local")
 DEMO_USER = {"id": 1, "email": "demo@clearflow.local", "name": "Demo User", "role": "self_owner"}
 
 @router.post("/register", status_code=201)
-async def register(data: dict, db: AsyncSession = Depends(get_shared_db)):
+async def register(data: dict, db: Optional[AsyncSession] = Depends(get_shared_db)):
+    if db is None:
+        return {"token": DEMO_TOKEN, "user": DEMO_USER}
     try:
         result = await db.execute(select(User).where(User.email == data.get("email")))
         if result.scalar_one_or_none():
@@ -91,7 +97,9 @@ async def register(data: dict, db: AsyncSession = Depends(get_shared_db)):
         return {"token": DEMO_TOKEN, "user": DEMO_USER}
 
 @router.post("/login")
-async def login(data: dict, db: AsyncSession = Depends(get_shared_db)):
+async def login(data: dict, db: Optional[AsyncSession] = Depends(get_shared_db)):
+    if db is None:
+        return {"token": DEMO_TOKEN, "user": DEMO_USER}
     try:
         result = await db.execute(select(User).where(User.email == data.get("email")))
         user = result.scalar_one_or_none()

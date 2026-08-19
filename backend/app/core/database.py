@@ -152,7 +152,15 @@ async def get_db(
 
 # ── Legacy helpers ────────────────────────────────────────────────────────────
 
-async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
+async def get_shared_db() -> AsyncGenerator[AsyncSession | None, None]:
+    """Explicit dependency for endpoints that MUST touch the shared meta-DB.
+    Returns None if DB connection fails (for demo resilience)."""
+    try:
+        async with SharedSessionLocal() as session:
+            yield session
+    except Exception:
+        yield None
+
     """Explicit dependency for endpoints that MUST touch the shared meta-DB."""
     async with SharedSessionLocal() as session:
         yield session
