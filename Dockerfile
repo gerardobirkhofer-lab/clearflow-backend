@@ -16,7 +16,7 @@ RUN pip install poetry && \
     poetry install --only main --no-interaction --no-ansi --no-root
 
 # Application code
-COPY backend/backend/app ./app
+COPY backend/app ./app
 
 # Expose port
 EXPOSE 8000
