@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 import structlog
 
-from .core.config import Settings, get_settings
+from .core.config import get_settings
 from .core.database import shared_engine, init_db
 from .core.redis import get_redis
 from .api.v1 import (
@@ -45,15 +45,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan events: startup and shutdown."""
     # Startup
     settings = get_settings()
-    logger.info("app_starting", environment="development")
+    logger.info("app_starting", environment=settings.ENVIRONMENT)
 
     # Initialize database (create tables if they don't exist)
-    await init_db()
+    try:
+        await init_db()
+        logger.info("db_initialized")
+    except Exception as e:
+        logger.error("db_init_failed", error=str(e))
 
-    # Test Redis connection
-    redis = await get_redis()
-    await redis.ping()
-    logger.info("redis_connected")
+    # Test Redis connection (non-blocking)
+    try:
+        redis_client = await get_redis()
+        await redis_client.ping()
+        logger.info("redis_connected")
+    except Exception as e:
+        logger.warning("redis_unavailable", error=str(e))
 
     yield
 
