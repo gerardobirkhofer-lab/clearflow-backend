@@ -8,6 +8,7 @@ from typing import Optional
 from app.core.database import get_db
 from app.core.email import get_email_service
 from app.models.dispute import Dispute
+from app.models.dispute_email_log import DisputeEmailLog
 from app.models.provider import Provider
 
 router = APIRouter()
@@ -410,7 +411,63 @@ ClearView Revenue Intelligence
         body_html=body_html,
     )
 
+    # Save log regardless of success/failure
+    log = DisputeEmailLog(
+        tenant_id=tenant_id,
+        provider_name=provider_name,
+        amount=amount,
+        concept=concept,
+        description=description,
+        date=date,
+        days_open=days_open,
+        recipient_email=provider.dispute_email,
+        status="sent" if result["success"] else "failed",
+        error_message=result.get("error") if not result["success"] else None,
+    )
+    db.add(log)
+    await db.commit()
+
     if not result["success"]:
         raise HTTPException(status_code=500, detail=f"Email failed: {result.get('error')}")
 
-    return {"message": "Dispute email sent", "to": provider.dispute_email}
+    return {"message": "Dispute email sent", "to": provider.dispute_email, "log_id": log.id}
+
+
+@router.get("/email-logs")
+async def list_email_logs(
+    tenant_id: uuid.UUID,
+    provider: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all dispute emails sent for a tenant."""
+    query = select(DisputeEmailLog).where(DisputeEmailLog.tenant_id == tenant_id)
+    
+    if provider:
+        query = query.where(DisputeEmailLog.provider_name == provider)
+    if status:
+        query = query.where(DisputeEmailLog.status == status)
+    
+    result = await db.execute(query.order_by(DisputeEmailLog.sent_at.desc()))
+    logs = result.scalars().all()
+    
+    return {
+        "logs": [
+            {
+                "id": log.id,
+                "provider_name": log.provider_name,
+                "amount": log.amount,
+                "currency": log.currency,
+                "concept": log.concept,
+                "description": log.description,
+                "date": log.date,
+                "days_open": log.days_open,
+                "recipient_email": log.recipient_email,
+                "status": log.status,
+                "error_message": log.error_message,
+                "sent_at": log.sent_at.isoformat() if log.sent_at else None,
+            }
+            for log in logs
+        ],
+        "total": len(logs),
+    }
