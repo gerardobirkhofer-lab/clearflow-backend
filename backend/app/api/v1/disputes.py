@@ -1,15 +1,17 @@
 import uuid
 from fastapi import APIRouter, HTTPException, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, case
+from sqlalchemy import select, func, and_
 from datetime import datetime, timedelta
 from typing import Optional
 
 from app.core.database import get_db
+from app.core.email import get_email_service
 from app.models.dispute import Dispute
-from app.models.bank_transaction import BankTransaction
+from app.models.provider import Provider
 
 router = APIRouter()
+
 
 @router.get("/")
 async def list_disputes(
@@ -56,6 +58,7 @@ async def list_disputes(
         ],
         "total": len(disputes),
     }
+
 
 @router.get("/summary")
 async def get_dispute_summary(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -173,6 +176,7 @@ async def get_dispute_summary(tenant_id: uuid.UUID, db: AsyncSession = Depends(g
         "weekly_trend": weeks,
     }
 
+
 @router.post("/", status_code=201)
 async def create_dispute(
     tenant_id: uuid.UUID,
@@ -197,6 +201,7 @@ async def create_dispute(
     await db.refresh(dispute)
     return {"id": dispute.id, "message": "Dispute created"}
 
+
 @router.patch("/{dispute_id}/resolve")
 async def resolve_dispute(
     dispute_id: int,
@@ -217,3 +222,195 @@ async def resolve_dispute(
     
     await db.commit()
     return {"message": "Dispute resolved", "days_to_resolve": dispute.days_to_resolve}
+
+
+@router.post("/{dispute_id}/send-email")
+async def send_dispute_email(
+    dispute_id: int,
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send dispute report email to provider's configured dispute email."""
+    result = await db.execute(
+        select(Dispute).where(
+            Dispute.id == dispute_id,
+            Dispute.tenant_id == tenant_id,
+        )
+    )
+    dispute = result.scalar_one_or_none()
+    if not dispute:
+        raise HTTPException(status_code=404, detail="Dispute not found")
+
+    # Find provider to get dispute_email
+    provider_result = await db.execute(
+        select(Provider).where(
+            Provider.tenant_id == tenant_id,
+            Provider.name == dispute.provider_name,
+        )
+    )
+    provider = provider_result.scalar_one_or_none()
+    if not provider or not provider.dispute_email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No dispute email configured for provider {dispute.provider_name}",
+        )
+
+    age_days = (datetime.utcnow() - dispute.opened_at).days if dispute.opened_at else 0
+
+    subject = f"[{dispute.provider_name}] Discrepancy Report #{dispute.id} — {age_days} days open"
+
+    body_text = f"""CLEARVIEW — REVENUE INTELLIGENCE DISCREPANCY REPORT
+
+Provider: {dispute.provider_name}
+Dispute ID: #{dispute.id}
+Report Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+
+═══════════════════════════════════════════════════════════════
+DISCREPANCY DETAILS
+═══════════════════════════════════════════════════════════════
+Type: {dispute.dispute_type}
+Amount: €{dispute.amount:.2f}
+Days Open: {age_days}
+Status: {dispute.status}
+
+Description:
+{dispute.description or 'N/A'}
+
+═══════════════════════════════════════════════════════════════
+REQUESTED ACTION
+═══════════════════════════════════════════════════════════════
+Please review and credit the outstanding amount within the next
+settlement cycle. Reference Dispute ID #{dispute.id} in your response.
+
+Best regards,
+ClearView Revenue Intelligence
+"""
+
+    body_html = f"""<html>
+<body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
+<h2 style="color: #635bff;">ClearView — Revenue Intelligence</h2>
+<h3>Discrepancy Report #{dispute.id}</h3>
+
+<table style="border-collapse: collapse; width: 100%; max-width: 600px;">
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Provider:</strong></td><td>{dispute.provider_name}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Type:</strong></td><td>{dispute.dispute_type}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Amount:</strong></td><td>€{dispute.amount:.2f}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Days Open:</strong></td><td>{age_days}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Status:</strong></td><td>{dispute.status}</td></tr>
+</table>
+
+<p><strong>Description:</strong><br>{dispute.description or 'N/A'}</p>
+
+<p style="background: #f0fdf4; padding: 12px; border-radius: 8px;">
+  <strong>Requested Action:</strong> Please review and credit the outstanding amount 
+  within the next settlement cycle. Reference Dispute ID #{dispute.id} in your response.
+</p>
+
+<p>Best regards,<br><strong>ClearView Revenue Intelligence</strong></p>
+</body>
+</html>"""
+
+    email_service = get_email_service()
+    result = await email_service.send_email(
+        to=provider.dispute_email,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+    )
+
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=f"Email failed: {result.get('error')}")
+
+    return {"message": "Dispute email sent", "to": provider.dispute_email}
+
+
+@router.post("/send-email-direct")
+async def send_dispute_email_direct(
+    tenant_id: uuid.UUID,
+    provider_name: str,
+    amount: float,
+    description: str = "",
+    concept: str = "",
+    date: str = "",
+    days_open: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """Send dispute email directly without creating a dispute record first."""
+    # Find provider to get dispute_email
+    provider_result = await db.execute(
+        select(Provider).where(
+            Provider.tenant_id == tenant_id,
+            Provider.name == provider_name,
+        )
+    )
+    provider = provider_result.scalar_one_or_none()
+    if not provider or not provider.dispute_email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No dispute email configured for provider {provider_name}",
+        )
+
+    subject = f"[{provider_name}] Discrepancy Report — {days_open} days open"
+
+    body_text = f"""CLEARVIEW — REVENUE INTELLIGENCE DISCREPANCY REPORT
+
+Provider: {provider_name}
+Report Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}
+
+═══════════════════════════════════════════════════════════════
+DISCREPANCY DETAILS
+═══════════════════════════════════════════════════════════════
+Concept: {concept or 'N/A'}
+Amount: €{amount:.2f}
+Date: {date or 'N/A'}
+Days Open: {days_open}
+
+Description:
+{description or 'N/A'}
+
+═══════════════════════════════════════════════════════════════
+REQUESTED ACTION
+═══════════════════════════════════════════════════════════════
+Please review and credit the outstanding amount within the next
+settlement cycle.
+
+Best regards,
+ClearView Revenue Intelligence
+"""
+
+    body_html = f"""<html>
+<body style="font-family: Arial, sans-serif; color: #333; line-height: 1.6;">
+<h2 style="color: #635bff;">ClearView — Revenue Intelligence</h2>
+<h3>Discrepancy Report</h3>
+
+<table style="border-collapse: collapse; width: 100%; max-width: 600px;">
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Provider:</strong></td><td>{provider_name}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Concept:</strong></td><td>{concept or 'N/A'}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Amount:</strong></td><td>€{amount:.2f}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Date:</strong></td><td>{date or 'N/A'}</td></tr>
+  <tr><td style="padding: 8px; border-bottom: 1px solid #eee;"><strong>Days Open:</strong></td><td>{days_open}</td></tr>
+</table>
+
+<p><strong>Description:</strong><br>{description or 'N/A'}</p>
+
+<p style="background: #f0fdf4; padding: 12px; border-radius: 8px;">
+  <strong>Requested Action:</strong> Please review and credit the outstanding amount
+  within the next settlement cycle.
+</p>
+
+<p>Best regards,<br><strong>ClearView Revenue Intelligence</strong></p>
+</body>
+</html>"""
+
+    email_service = get_email_service()
+    result = await email_service.send_email(
+        to=provider.dispute_email,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+    )
+
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=f"Email failed: {result.get('error')}")
+
+    return {"message": "Dispute email sent", "to": provider.dispute_email}

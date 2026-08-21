@@ -8,6 +8,11 @@ from datetime import datetime
 
 from app.core.database import get_db
 from app.models.provider_transaction import ProviderTransaction
+from app.models.provider import Provider
+from app.models_orm import Tenant
+
+router = APIRouter()
+from app.models.provider_transaction import ProviderTransaction
 from app.models_orm import Tenant
 
 router = APIRouter()
@@ -122,6 +127,81 @@ def _parse_amount(val):
         return 0.0
 
 def _parse_date(val):
+    if not val:
+        return None
+    val = str(val).strip()
+    formats = ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%m/%d/%Y', '%d/%m/%y']
+    for fmt in formats:
+        try:
+            return datetime.strptime(val, fmt)
+        except:
+            continue
+    return None
+
+
+@router.get("/list")
+async def list_providers(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """List all providers configured for a tenant."""
+    result = await db.execute(
+        select(Provider).where(Provider.tenant_id == tenant_id)
+    )
+    providers = result.scalars().all()
+    return {
+        "providers": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "provider_type": p.provider_type,
+                "settlement_mode": p.settlement_mode,
+                "fee_percent": p.fee_percent,
+                "fee_fixed": p.fee_fixed,
+                "monthly_fee": p.monthly_fee,
+                "dispute_email": p.dispute_email,
+                "is_active": p.is_active,
+            }
+            for p in providers
+        ]
+    }
+
+
+@router.patch("/{provider_id}")
+async def update_provider(
+    provider_id: int,
+    tenant_id: uuid.UUID,
+    dispute_email: str = "",
+    fee_percent: float = None,
+    fee_fixed: float = None,
+    monthly_fee: float = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update provider settings (dispute email, fees, etc.)."""
+    result = await db.execute(
+        select(Provider).where(
+            Provider.id == provider_id,
+            Provider.tenant_id == tenant_id,
+        )
+    )
+    provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found")
+
+    if dispute_email:
+        provider.dispute_email = dispute_email
+    if fee_percent is not None:
+        provider.fee_percent = fee_percent
+    if fee_fixed is not None:
+        provider.fee_fixed = fee_fixed
+    if monthly_fee is not None:
+        provider.monthly_fee = monthly_fee
+
+    await db.commit()
+    await db.refresh(provider)
+    return {
+        "id": provider.id,
+        "name": provider.name,
+        "dispute_email": provider.dispute_email,
+        "message": "Provider updated",
+    }
     if not val:
         return None
     val = str(val).strip()

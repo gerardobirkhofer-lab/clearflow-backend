@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     MINIO_BUCKET_NAME: str = "clearflow"
     MAILPIT_HOST: str = "mailpit"
     MAILPIT_SMTP_PORT: int = 1025
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USER: str = ""
+    SMTP_PASS: str = ""
+    SMTP_SENDER: str = "noreply@clearview.app"
     CORS_ORIGINS: list[str] = ["*"]
 
     class Config:

@@ -19,6 +19,7 @@ class Provider(Base):
     fee_percent = Column(Float, default=0.0)
     fee_fixed = Column(Float, default=0.0)
     monthly_fee = Column(Float, default=0.0)
+    dispute_email = Column(String(255), nullable=True)
     contract_file_url = Column(String(500), nullable=True)
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, server_default=func.now())
