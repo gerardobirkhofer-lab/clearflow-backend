@@ -9,6 +9,7 @@ python = "^3.11"
 fastapi = "^0.110.0"
 uvicorn = {extras = ["standard"], version = "^0.27.0"}
 sqlalchemy = {extras = ["asyncpg"], version = "^2.0.0"}
+aiosqlite = "^0.20.0"
 alembic = "^1.13.0"
 asyncpg = "^0.29.0"
 redis = "^5.0.0"
@@ -57,5 +58,3 @@ python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
-pyjwt = "^2.8.0"
-bcrypt = "^3.2.2"
