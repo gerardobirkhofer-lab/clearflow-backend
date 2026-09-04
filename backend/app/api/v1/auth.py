@@ -19,7 +19,13 @@ DEMO_PAYLOAD = {
     "exp": datetime.now(timezone.utc) + timedelta(days=7)
 }
 DEMO_TOKEN = jwt.encode(DEMO_PAYLOAD, SECRET_KEY, algorithm=ALGORITHM)
-DEMO_USER = {"id": 1, "email": "demo@clearflow.local", "name": "Demo User", "role": "self_owner"}
+DEMO_USER = {
+    "id": 1,
+    "email": "demo@clearflow.local",
+    "name": "Demo User",
+    "role": "self_owner",
+    "tenant_id": "22222222-2222-2222-2222-222222222222",
+}
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),

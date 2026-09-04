@@ -1,4 +1,4 @@
-from sqlalchemy.dialects.postgresql import UUID
+from app.core.uuid_type import UUID
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey
 from sqlalchemy.sql import func
 from app.core.database import Base
@@ -7,7 +7,7 @@ from app.core.database import Base
 class DisputeEmailLog(Base):
     __tablename__ = "dispute_email_logs"
     id = Column(Integer, primary_key=True, index=True)
-    tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
+    tenant_id = Column(UUID, nullable=False)
     provider_name = Column(String(50), nullable=False)
     amount = Column(Float, nullable=False)
     currency = Column(String(3), default="EUR")

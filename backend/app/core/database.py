@@ -27,7 +27,10 @@ settings = get_settings()
 
 
 def _async_url(url: str) -> str:
-    """Render gives postgres:// or postgresql://; asyncpg needs postgresql+asyncpg://."""
+    """Render gives postgres:// or postgresql://; asyncpg needs postgresql+asyncpg://.
+    SQLite uses sqlite+aiosqlite://."""
+    if url.startswith("sqlite:"):
+        return url
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql+asyncpg://", 1)
     if url.startswith("postgresql://") and "+asyncpg" not in url:
@@ -49,6 +52,9 @@ SharedSessionLocal = async_sessionmaker(
 )
 
 Base = declarative_base()
+
+# Import legacy models so they register in Base.metadata
+from app.models import bank_account, bank_transaction, dispute, dispute_email_log, expected_collection, provider, provider_connection, provider_transaction, user
 
 
 # ── Tenant-aware DB Manager ───────────────────────────────────────────────────
@@ -156,19 +162,19 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
-    Drops existing tables first to reset schema, then recreates both
-    legacy tables (auth/users) and new ORM tables.
-
-    Legacy tables have FKs to tenants (new), so we combine both metadatas
-    into one so SQLAlchemy can resolve dependencies automatically."""
+    Combines legacy and new ORM tables, skipping duplicates."""
     from app import models_orm as orm
 
     combined = MetaData()
-    for table in Base.metadata.tables.values():
-        table.tometadata(combined)
-    for table in orm.Base.metadata.tables.values():
+
+    # Add legacy tables first (skip 'users' which conflicts with new ORM)
+    for name, table in Base.metadata.tables.items():
+        if name != "users":
+            table.tometadata(combined)
+
+    # Add new ORM tables
+    for name, table in orm.Base.metadata.tables.items():
         table.tometadata(combined)
 
     async with shared_engine.begin() as conn:
-        await conn.run_sync(combined.drop_all)
         await conn.run_sync(combined.create_all)

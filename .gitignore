@@ -32,3 +32,7 @@ Thumbs.db
 .env
 *.key
 *.pem
+data/
+*.db
+start_local.py
+test_api.sh
