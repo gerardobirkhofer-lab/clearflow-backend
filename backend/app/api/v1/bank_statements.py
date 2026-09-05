@@ -49,7 +49,7 @@ async def upload_statement(
         clean_row = {k.strip().lower() if k else '': v for k, v in row.items()}
         
         concept = _get_field(clean_row, ['concepto', 'descripcion', 'description', 'concept', 'detalle'])
-        amount = _parse_amount(_get_field(clean_row, ['importe', 'amount', 'cantidad', 'valor']))
+        amount = _parse_amount(_get_field(clean_row, ['movimiento', 'importe', 'amount', 'cantidad', 'valor']))
         tx_date = _parse_date(_get_field(clean_row, ['fecha', 'date', 'fecha valor', 'fecha operacion']))
         reference = _get_field(clean_row, ['referencia', 'reference', 'ref', 'numero'])
         balance = _parse_amount(_get_field(clean_row, ['saldo', 'balance']))
@@ -90,9 +90,41 @@ def _get_field(row: dict, keys: list) -> str:
     return ''
 
 def _parse_amount(val):
+    """
+    Parsea montos de forma inteligente, auto-detectando el formato.
+    Soporta: 1.234,56 (ES) | 1,234.56 (US) | 1234.56 | 1234,56
+    """
     if not val:
         return 0.0
-    val = str(val).replace('.', '').replace(',', '.').replace('€', '').replace('$', '').replace('+', '').strip()
+    
+    val = str(val).replace('€', '').replace('$', '').replace('+', '').strip()
+    
+    # Caso: tiene ambos separadores (miles y decimales)
+    if ',' in val and '.' in val:
+        last_comma = val.rfind(',')
+        last_dot = val.rfind('.')
+        
+        if last_comma > last_dot:
+            # Formato ES: 1.234,56 → 1234.56
+            val = val.replace('.', '').replace(',', '.')
+        else:
+            # Formato US: 1,234.56 → 1234.56
+            val = val.replace(',', '')
+    
+    # Caso: solo tiene coma
+    elif ',' in val:
+        # Puede ser decimal (ES: 1234,56) o miles (US: 1,234)
+        # Si hay solo una coma y 1-2 dígitos después → decimal
+        parts = val.split(',')
+        if len(parts) == 2 and len(parts[1]) <= 2 and parts[1].isdigit():
+            val = val.replace(',', '.')
+        else:
+            # Es separador de miles
+            val = val.replace(',', '')
+    
+    # Caso: solo tiene punto
+    # Ya está en formato correcto (1234.56)
+    
     try:
         return float(val)
     except:

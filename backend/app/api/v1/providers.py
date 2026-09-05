@@ -12,10 +12,6 @@ from app.models.provider import Provider
 from app.models_orm import Tenant
 
 router = APIRouter()
-from app.models.provider_transaction import ProviderTransaction
-from app.models_orm import Tenant
-
-router = APIRouter()
 
 @router.post("/upload")
 async def upload_provider_report(
@@ -50,7 +46,7 @@ async def upload_provider_report(
     for row in reader:
         clean_row = {k.strip().lower() if k else '': v for k, v in row.items()}
         concept = _get_field(clean_row, ['concepto', 'descripcion', 'description', 'concept', 'detalle', 'tipo'])
-        amount = _parse_amount(_get_field(clean_row, ['importe', 'amount', 'cantidad', 'valor', 'total']))
+        amount = _parse_amount(_get_field(clean_row, ['liquido', 'net', 'importe', 'amount', 'cantidad', 'valor', 'total']))
         tx_date = _parse_date(_get_field(clean_row, ['fecha', 'date', 'fecha valor', 'fecha operacion']))
         reference = _get_field(clean_row, ['referencia', 'reference', 'ref', 'numero', 'id'])
 
@@ -118,9 +114,35 @@ def _get_field(row: dict, keys: list) -> str:
     return ''
 
 def _parse_amount(val):
+    """
+    Parsea montos de forma inteligente, auto-detectando el formato.
+    Soporta: 1.234,56 (ES) | 1,234.56 (US) | 1234.56 | 1234,56
+    """
     if not val:
         return 0.0
-    val = str(val).replace('.', '').replace(',', '.').replace('€', '').replace('$', '').replace('+', '').strip()
+    
+    val = str(val).replace('€', '').replace('$', '').replace('+', '').strip()
+    
+    # Caso: tiene ambos separadores (miles y decimales)
+    if ',' in val and '.' in val:
+        last_comma = val.rfind(',')
+        last_dot = val.rfind('.')
+        
+        if last_comma > last_dot:
+            # Formato ES: 1.234,56 → 1234.56
+            val = val.replace('.', '').replace(',', '.')
+        else:
+            # Formato US: 1,234.56 → 1234.56
+            val = val.replace(',', '')
+    
+    # Caso: solo tiene coma
+    elif ',' in val:
+        parts = val.split(',')
+        if len(parts) == 2 and len(parts[1]) <= 2 and parts[1].isdigit():
+            val = val.replace(',', '.')
+        else:
+            val = val.replace(',', '')
+    
     try:
         return float(val)
     except:
@@ -202,13 +224,3 @@ async def update_provider(
         "dispute_email": provider.dispute_email,
         "message": "Provider updated",
     }
-    if not val:
-        return None
-    val = str(val).strip()
-    formats = ['%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%m/%d/%Y', '%d/%m/%y']
-    for fmt in formats:
-        try:
-            return datetime.strptime(val, fmt)
-        except:
-            continue
-    return None
