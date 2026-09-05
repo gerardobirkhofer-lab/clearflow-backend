@@ -177,7 +177,6 @@ async def init_db() -> None:
         table.tometadata(combined)
 
     async with shared_engine.begin() as conn:
-    async with shared_engine.begin() as conn:
         await conn.run_sync(combined.create_all)
 
     # Ensure default tenant exists (required for demo user)
