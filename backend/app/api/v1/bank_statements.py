@@ -216,6 +216,13 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
             "provider_count": len(prov_txs),
             "matched_count": sum(1 for b in bank_txs if b.matched),
             "pending_count": sum(1 for b in bank_txs if not b.matched) + sum(1 for p in prov_txs if not p.matched),
+            # Aliases for frontend compatibility
+            "bank_transactions": len(bank_txs),
+            "provider_transactions": len(prov_txs),
+            "matched_bank": matched_bank,
+            "matched_provider": matched_bank,
+            "pending_bank": pending_bank,
+            "pending_provider": pending_provider,
         },
         "recent_activity": recent_bank + recent_provider,
         "discrepancies": {
