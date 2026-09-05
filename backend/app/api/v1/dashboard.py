@@ -10,7 +10,7 @@ from datetime import date, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func, and_, text
+from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.database import get_db
@@ -26,55 +26,6 @@ from ...models.bank_transaction import BankTransaction
 from ...models.provider_transaction import ProviderTransaction
 
 router = APIRouter(prefix="/dashboard")
-
-
-@router.get("/debug")
-async def dashboard_debug(
-    db: AsyncSession = Depends(get_db),
-    current_user: CurrentUser = Depends(get_current_user),
-    tenant_id_override: UUID | None = Query(None, alias="tenant_id"),
-    tenant_id: UUID = Depends(get_current_tenant),
-):
-    """Debug endpoint to verify queries."""
-    effective_tenant_id = tenant_id_override or tenant_id
-
-    # Count provider transactions
-    prov_count = await db.scalar(
-        select(func.count()).where(ProviderTransaction.tenant_id == effective_tenant_id)
-    ) or 0
-
-    # Sum provider amounts
-    prov_sum = await db.scalar(
-        select(func.sum(ProviderTransaction.amount)).where(ProviderTransaction.tenant_id == effective_tenant_id)
-    )
-
-    # Count bank transactions
-    bank_count = await db.scalar(
-        select(func.count()).where(BankTransaction.tenant_id == effective_tenant_id)
-    ) or 0
-
-    # Sum bank amounts
-    bank_sum = await db.scalar(
-        select(func.sum(BankTransaction.amount)).where(BankTransaction.tenant_id == effective_tenant_id)
-    )
-
-    # Test raw SQL
-    raw_result = await db.execute(
-        text("SELECT COUNT(*), SUM(amount) FROM provider_transactions WHERE tenant_id = :tid"),
-        {"tid": str(effective_tenant_id)}
-    )
-    raw_count, raw_sum = raw_result.first() or (0, 0)
-
-    return {
-        "effective_tenant_id": str(effective_tenant_id),
-        "fallback_tenant_id": str(tenant_id),
-        "provider_count": prov_count,
-        "provider_sum": float(prov_sum) if prov_sum is not None else None,
-        "bank_count": bank_count,
-        "bank_sum": float(bank_sum) if bank_sum is not None else None,
-        "raw_count": raw_count,
-        "raw_sum": float(raw_sum) if raw_sum is not None else None,
-    }
 
 
 @router.get("/summary", response_model=DashboardSummaryResponse)
