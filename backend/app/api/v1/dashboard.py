@@ -1,6 +1,8 @@
 """
 API Router: Dashboard
 Aggregated data for the home dashboard.
+Reads from legacy tables (bank_transactions, provider_transactions) where
+CSV uploads actually store data, with ORM tables as fallback.
 """
 from __future__ import annotations
 
@@ -8,17 +10,20 @@ from datetime import date, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import select, func, and_, case
+from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.database import get_db
 from ...core.auth import get_current_user, CurrentUser
 from ...core.tenant import get_current_tenant
 from ...models_orm import (
-    CardCollection, BankMovement, ReconciliationResult, ReconciliationStatus,
-    Institution, TPVClosingReport,
+    ReconciliationResult, ReconciliationStatus,
 )
 from ...schemas import DashboardSummaryResponse, CashFlowDashboardResponse
+
+# Legacy models where CSV data is actually stored
+from ...models.bank_transaction import BankTransaction
+from ...models.provider_transaction import ProviderTransaction
 
 router = APIRouter(prefix="/dashboard")
 
@@ -29,48 +34,71 @@ async def get_dashboard_summary(
     current_user: CurrentUser = Depends(get_current_user),
     tenant_id: UUID = Depends(get_current_tenant),
 ):
-    """Get dashboard key metrics (aggregates all historical data)."""
+    """Get dashboard key metrics from legacy transaction tables."""
     today = date.today()
+    yesterday = today - timedelta(days=1)
 
-    # Total collections (all time)
-    collections_query = select(func.sum(CardCollection.amount_gross)).where(
-        CardCollection.tenant_id == tenant_id
+    # --- Provider transactions (sales/collections) ---
+    prov_today_query = select(func.sum(ProviderTransaction.amount)).where(
+        and_(
+            ProviderTransaction.tenant_id == tenant_id,
+            func.date(ProviderTransaction.transaction_date) == today,
+        )
     )
-    today_total = await db.scalar(collections_query) or 0
+    prov_today = await db.scalar(prov_today_query) or 0
 
-    # Total collections up to yesterday for comparison
-    yesterday_query = select(func.sum(CardCollection.amount_gross)).where(
-        and_(CardCollection.tenant_id == tenant_id, CardCollection.collection_date < today)
+    prov_yesterday_query = select(func.sum(ProviderTransaction.amount)).where(
+        and_(
+            ProviderTransaction.tenant_id == tenant_id,
+            func.date(ProviderTransaction.transaction_date) == yesterday,
+        )
     )
-    yesterday_total = await db.scalar(yesterday_query) or 0
+    prov_yesterday = await db.scalar(prov_yesterday_query) or 0
 
-    # Cleared vs pending counts (all time)
-    status_counts = await db.execute(
-        select(
-            CardCollection.status,
-            func.count().label("count"),
-            func.sum(CardCollection.amount_gross).label("total"),
-        ).where(
-            CardCollection.tenant_id == tenant_id
-        ).group_by(CardCollection.status)
+    bank_matched_query = select(func.sum(BankTransaction.amount)).where(
+        and_(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.matched == 1,
+        )
     )
+    bank_matched = await db.scalar(bank_matched_query) or 0
 
-    cleared = 0
-    pending = 0
-    for row in status_counts:
-        status_val = row.status
-        if status_val in (ReconciliationStatus.CLEARED.value, ReconciliationStatus.MATCHED.value):
-            cleared = (cleared or 0) + (row.total or 0)
-        elif status_val in (ReconciliationStatus.PENDING.value, ReconciliationStatus.PARTIAL.value, ReconciliationStatus.UNMATCHED.value, ReconciliationStatus.DISCREPANCY.value):
-            pending = (pending or 0) + (row.total or 0)
+    bank_unmatched_query = select(func.sum(BankTransaction.amount)).where(
+        and_(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.matched == 0,
+        )
+    )
+    bank_unmatched = await db.scalar(bank_unmatched_query) or 0
 
-    # Latest bank balance
-    balance_query = select(BankMovement.balance_after).where(
-        BankMovement.tenant_id == tenant_id
-    ).order_by(BankMovement.booking_date.desc()).limit(1)
-    latest_balance = await db.scalar(balance_query) or 0
+    prov_matched_query = select(func.sum(ProviderTransaction.amount)).where(
+        and_(
+            ProviderTransaction.tenant_id == tenant_id,
+            ProviderTransaction.matched == 1,
+        )
+    )
+    prov_matched = await db.scalar(prov_matched_query) or 0
 
-    # Discrepancy count
+    prov_unmatched_query = select(func.sum(ProviderTransaction.amount)).where(
+        and_(
+            ProviderTransaction.tenant_id == tenant_id,
+            ProviderTransaction.matched == 0,
+        )
+    )
+    prov_unmatched = await db.scalar(prov_unmatched_query) or 0
+
+    # Latest bank balance (from most recent bank transaction with balance)
+    balance_query = select(BankTransaction.balance).where(
+        and_(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.balance != None,
+        )
+    ).order_by(BankTransaction.transaction_date.desc()).limit(1)
+    latest_balance_row = await db.execute(balance_query)
+    latest_balance_scalar = latest_balance_row.scalar_one_or_none()
+    latest_balance = latest_balance_scalar or 0
+
+    # Discrepancy count from reconciliation results
     discrepancy_query = select(func.count()).where(
         and_(
             ReconciliationResult.tenant_id == tenant_id,
@@ -80,23 +108,37 @@ async def get_dashboard_summary(
     )
     discrepancy_count = await db.scalar(discrepancy_query) or 0
 
-    # Uncleared count
-    uncleared_query = select(func.count()).where(
-        and_(
-            CardCollection.tenant_id == tenant_id,
-            CardCollection.status != ReconciliationStatus.CLEARED,
-            CardCollection.collection_date <= today,
+    # Uncleared count = unmatched transactions
+    uncleared_bank = await db.scalar(
+        select(func.count()).where(
+            and_(
+                BankTransaction.tenant_id == tenant_id,
+                BankTransaction.matched == 0,
+            )
         )
-    )
-    uncleared_count = await db.scalar(uncleared_query) or 0
+    ) or 0
+    uncleared_provider = await db.scalar(
+        select(func.count()).where(
+            and_(
+                ProviderTransaction.tenant_id == tenant_id,
+                ProviderTransaction.matched == 0,
+            )
+        )
+    ) or 0
+    uncleared_count = int(uncleared_bank) + int(uncleared_provider)
+
+    today_collections = abs(float(prov_today))
+    yesterday_collections = abs(float(prov_yesterday))
+    cleared_amount = abs(float(bank_matched)) + abs(float(prov_matched))
+    pending_amount = abs(float(bank_unmatched)) + abs(float(prov_unmatched))
 
     return DashboardSummaryResponse(
-        today_collections=today_total,
-        yesterday_collections=yesterday_total,
-        change_percent=((today_total - yesterday_total) / yesterday_total * 100) if yesterday_total else 0,
-        cleared_amount=cleared,
-        pending_amount=pending,
-        bank_balance=latest_balance,
+        today_collections=today_collections,
+        yesterday_collections=yesterday_collections,
+        change_percent=((today_collections - yesterday_collections) / yesterday_collections * 100) if yesterday_collections else 0,
+        cleared_amount=cleared_amount,
+        pending_amount=pending_amount,
+        bank_balance=abs(float(latest_balance)),
         discrepancy_count=discrepancy_count,
         uncleared_count=uncleared_count,
     )
