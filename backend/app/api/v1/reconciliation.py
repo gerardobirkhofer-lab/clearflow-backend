@@ -3,12 +3,21 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from datetime import timedelta
+from collections import defaultdict
 
 from app.core.database import get_db
 from app.models.bank_transaction import BankTransaction
 from app.models.provider_transaction import ProviderTransaction
 
 router = APIRouter()
+
+
+def _date_key(dt):
+    """Normalize date to date object for indexing."""
+    if dt is None:
+        return None
+    return dt.date() if hasattr(dt, 'date') else dt
+
 
 @router.post("/run")
 async def run_reconciliation(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
@@ -30,29 +39,72 @@ async def run_reconciliation(tenant_id: uuid.UUID, db: AsyncSession = Depends(ge
     )
     prov_txs = prov_result.scalars().all()
 
+    # ── OPTIMIZATION: Build indexes ──
+    # Index provider transactions by date for fast range lookup
+    prov_by_date = defaultdict(list)
+    for p in prov_txs:
+        dk = _date_key(p.transaction_date)
+        if dk:
+            prov_by_date[dk].append(p)
+
+    # Index provider transactions by rounded amount (±0.50 EUR buckets)
+    prov_by_amount = defaultdict(list)
+    for p in prov_txs:
+        bucket = round(float(p.amount), 0) if p.amount is not None else 0
+        prov_by_amount[bucket].append(p)
+        # Also index adjacent buckets for tolerance
+        prov_by_amount[bucket + 1].append(p)
+        prov_by_amount[bucket - 1].append(p)
+
     matched = []
     unmatched_bank = []
     unmatched_provider = []
-    discrepancies = []
 
-    # Simple matching: same amount + date within 3 days
     used_bank = set()
     used_prov = set()
 
     for b in bank_txs:
+        b_date = _date_key(b.transaction_date)
+        b_amount_bucket = round(float(b.amount), 0) if b.amount is not None else 0
+
+        # Gather candidates: same date ±3 days AND similar amount
+        candidates = set()
+
+        # Date candidates (±3 days)
+        if b_date:
+            for delta in range(-3, 4):
+                check_date = b_date + timedelta(days=delta)
+                for p in prov_by_date.get(check_date, []):
+                    if p.id not in used_prov:
+                        candidates.add(p)
+
+        # Amount candidates (fallback if no date candidates)
+        if not candidates:
+            for p in prov_by_amount.get(b_amount_bucket, []):
+                if p.id not in used_prov:
+                    candidates.add(p)
+            for p in prov_by_amount.get(b_amount_bucket + 1, []):
+                if p.id not in used_prov:
+                    candidates.add(p)
+            for p in prov_by_amount.get(b_amount_bucket - 1, []):
+                if p.id not in used_prov:
+                    candidates.add(p)
+
         best_match = None
         best_score = 0
 
-        for p in prov_txs:
-            if p.id in used_prov:
-                continue
-
+        for p in candidates:
             score = 0
-            # Amount match (exact = 3 points, within 1 cent = 2 points)
-            if abs(b.amount - p.amount) < 0.01:
-                score += 3
-            elif abs(b.amount - p.amount) < 1:
-                score += 2
+
+            # Amount match (exact = 3 points, within 1 cent = 2 points, within 1 EUR = 1 point)
+            if b.amount is not None and p.amount is not None:
+                amt_diff = abs(b.amount - p.amount)
+                if amt_diff < 0.01:
+                    score += 3
+                elif amt_diff < 1:
+                    score += 2
+                elif amt_diff < 5:
+                    score += 1
 
             # Date match (same day = 2 points, within 3 days = 1 point)
             if b.transaction_date and p.transaction_date:
@@ -65,6 +117,13 @@ async def run_reconciliation(tenant_id: uuid.UUID, db: AsyncSession = Depends(ge
             # Reference match
             if b.reference and p.reference and b.reference == p.reference:
                 score += 2
+
+            # Concept fuzzy match (simple substring)
+            if b.concept and p.concept:
+                b_conc = b.concept.lower()
+                p_conc = p.concept.lower()
+                if b_conc in p_conc or p_conc in b_conc:
+                    score += 1
 
             if score > best_score:
                 best_score = score
@@ -117,6 +176,7 @@ async def run_reconciliation(tenant_id: uuid.UUID, db: AsyncSession = Depends(ge
             "unmatched_provider_count": len(unmatched_provider),
         }
     }
+
 
 @router.get("/status")
 async def get_reconciliation_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
