@@ -177,4 +177,25 @@ async def init_db() -> None:
         table.tometadata(combined)
 
     async with shared_engine.begin() as conn:
+    async with shared_engine.begin() as conn:
         await conn.run_sync(combined.create_all)
+
+    # Ensure default tenant exists (required for demo user)
+    async with SharedSessionLocal() as session:
+        from app.models_orm import Tenant
+        result = await session.execute(
+            select(Tenant).where(Tenant.id == uuid.UUID("22222222-2222-2222-2222-222222222222"))
+        )
+        if result.scalar_one_or_none() is None:
+            default_tenant = Tenant(
+                id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                name="Default Tenant",
+                slug="default",
+                timezone="UTC",
+                currency="USD",
+                is_active=True,
+                subscription_plan="free",
+                tier="starter",
+            )
+            session.add(default_tenant)
+            await session.commit()
