@@ -78,6 +78,14 @@ async def upload_statement(
     
     await db.commit()
     
+    # Auto-trigger reconciliation after upload
+    try:
+        from app.services.reconciliation_service import ReconciliationService
+        service = ReconciliationService(db, tenant_id)
+        await service.run_reconciliation()
+    except Exception:
+        pass
+    
     return {
         "message": f"Successfully processed {len(transactions)} transactions",
         "count": len(transactions)
