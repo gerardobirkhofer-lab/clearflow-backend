@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import select, MetaData
+from sqlalchemy import select, MetaData, text
 
 from .config import get_settings
 from .auth import get_current_user, CurrentUser
@@ -54,7 +54,8 @@ SharedSessionLocal = async_sessionmaker(
 Base = declarative_base()
 
 # Import legacy models so they register in Base.metadata
-from app.models import bank_account, bank_transaction, dispute, dispute_email_log, expected_collection, provider, provider_connection, provider_transaction, user
+# NOTE: app.models.user is intentionally excluded — models_orm.User is the source of truth
+from app.models import bank_account, bank_transaction, dispute, dispute_email_log, expected_collection, provider, provider_connection, provider_transaction
 
 
 # ── Tenant-aware DB Manager ───────────────────────────────────────────────────
@@ -187,42 +188,16 @@ async def init_db() -> None:
         logger = logging.getLogger(__name__)
         logger.warning(f"DB init warning (tables likely exist): {e}")
 
-    # Ensure default tenant exists (required for demo user)
-    async with SharedSessionLocal() as session:
-        from app.models_orm import Tenant
-        result = await session.execute(
-            select(Tenant).where(Tenant.id == uuid.UUID("22222222-2222-2222-2222-222222222222"))
-        )
-        if result.scalar_one_or_none() is None:
-            default_tenant = Tenant(
-                id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
-                name="Default Tenant",
-                slug="default",
-                timezone="UTC",
-                currency="USD",
-                is_active=True,
-                subscription_plan="free",
-                tier="starter",
-            )
-            session.add(default_tenant)
-            await session.commit()
-    """Create all tables in the shared (meta) database on startup.
-    Combines legacy and new ORM tables, skipping duplicates."""
-    from app import models_orm as orm
-
-    combined = MetaData()
-
-    # Add legacy tables first (skip 'users' which conflicts with new ORM)
-    for name, table in Base.metadata.tables.items():
-        if name != "users":
-            table.tometadata(combined)
-
-    # Add new ORM tables
-    for name, table in orm.Base.metadata.tables.items():
-        table.tometadata(combined)
-
-    async with shared_engine.begin() as conn:
-        await conn.run_sync(combined.create_all)
+    # Add password_hash column to users if it doesn't exist (migration helper)
+    try:
+        async with shared_engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)"
+            ))
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Could not add password_hash column (may already exist): {e}")
 
     # Ensure default tenant exists (required for demo user)
     async with SharedSessionLocal() as session:

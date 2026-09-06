@@ -167,6 +167,24 @@ class User(Base, TenantMixin, TimestampMixin):
         UUID, primary_key=True, default=uuid.uuid4
     )
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    full_name: Mapped[str | None] = mapped_column(String(255))
+    role: Mapped[UserRole] = mapped_column(ENUM(UserRole, name="user_role"), default=UserRole.VIEWER)
+    auth_provider: Mapped[str] = mapped_column(String(50), default="local")  # local, auth0, clerk
+    auth_subject: Mapped[str | None] = mapped_column(String(255), index=True)  # External auth ID
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notification_email: Mapped[bool] = mapped_column(Boolean, default=True)
+    notification_webhook: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    tenant: Mapped["Tenant"] = relationship(back_populates="users")
+    """A user within a tenant workspace."""
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID, primary_key=True, default=uuid.uuid4
+    )
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     full_name: Mapped[str | None] = mapped_column(String(255))
     role: Mapped[UserRole] = mapped_column(ENUM(UserRole, name="user_role"), default=UserRole.VIEWER)
     auth_provider: Mapped[str] = mapped_column(String(50), default="auth0")  # auth0, clerk, local
