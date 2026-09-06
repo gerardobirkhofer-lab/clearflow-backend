@@ -1,7 +1,7 @@
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 import csv
 import io
 from datetime import datetime
@@ -11,6 +11,8 @@ from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
 
 router = APIRouter()
+
+BATCH_SIZE = 500  # Commit every N transactions to avoid memory/time issues
 
 @router.post("/upload")
 async def upload_statement(
@@ -41,8 +43,10 @@ async def upload_statement(
     comma_count = sum(line.count(',') for line in lines)
     delimiter = ';' if semi_count > comma_count else ','
     
-    transactions = []
     reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
+    
+    batch = []
+    total_count = 0
     
     for row in reader:
         # Clean up keys (strip whitespace, lowercase)
@@ -68,17 +72,24 @@ async def upload_statement(
             raw_data=str(row),
             matched=0,
         )
-        transactions.append(tx)
+        batch.append(tx)
+        total_count += 1
+        
+        # Flush batch to DB every BATCH_SIZE to avoid memory issues and long transactions
+        if len(batch) >= BATCH_SIZE:
+            db.add_all(batch)
+            await db.commit()
+            batch = []
     
-    if not transactions:
+    # Flush remaining batch
+    if batch:
+        db.add_all(batch)
+        await db.commit()
+    
+    if total_count == 0:
         raise HTTPException(status_code=400, detail="No valid transactions found in the file. Check the column headers.")
     
-    for tx in transactions:
-        db.add(tx)
-    
-    await db.commit()
-    
-    # Auto-trigger reconciliation after upload
+    # Auto-trigger reconciliation after upload (non-blocking, ignore errors)
     try:
         from app.services.reconciliation_service import ReconciliationService
         service = ReconciliationService(db, tenant_id)
@@ -87,8 +98,8 @@ async def upload_statement(
         pass
     
     return {
-        "message": f"Successfully processed {len(transactions)} transactions",
-        "count": len(transactions)
+        "message": f"Successfully processed {total_count} transactions",
+        "count": total_count
     }
 
 def _get_field(row: dict, keys: list) -> str:
@@ -178,40 +189,75 @@ async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
 
 @router.get("/dashboard")
 async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
-    from sqlalchemy import func
-    
-    # Bank transactions
-    bank_result = await db.execute(
-        select(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
-    )
-    bank_txs = bank_result.scalars().all()
-    
-    # Provider transactions  
     from app.models.provider_transaction import ProviderTransaction
-    prov_result = await db.execute(
-        select(ProviderTransaction).where(ProviderTransaction.tenant_id == tenant_id)
+    
+    # Use SQL aggregation instead of loading all transactions into memory
+    # Bank aggregates
+    bank_agg = await db.execute(
+        select(
+            func.count(BankTransaction.id).label("count"),
+            func.sum(BankTransaction.amount).label("total"),
+            func.sum(func.case((BankTransaction.matched == 1, BankTransaction.amount), else_=0)).label("matched"),
+            func.sum(func.case((BankTransaction.matched == 0, BankTransaction.amount), else_=0)).label("pending"),
+            func.sum(func.case((BankTransaction.matched == 1, 1), else_=0)).label("matched_count"),
+            func.sum(func.case((BankTransaction.matched == 0, 1), else_=0)).label("pending_count"),
+        ).where(BankTransaction.tenant_id == tenant_id)
     )
-    prov_txs = prov_result.scalars().all()
+    bank_row = bank_agg.one()
     
-    # Calculate totals
-    total_bank = sum(b.amount for b in bank_txs)
-    total_provider = sum(p.amount for p in prov_txs)
-    matched_bank = sum(b.amount for b in bank_txs if b.matched)
-    pending_bank = sum(b.amount for b in bank_txs if not b.matched)
-    pending_provider = sum(p.amount for p in prov_txs if not p.matched)
+    # Provider aggregates
+    prov_agg = await db.execute(
+        select(
+            func.count(ProviderTransaction.id).label("count"),
+            func.sum(ProviderTransaction.amount).label("total"),
+            func.sum(func.case((ProviderTransaction.matched == 1, ProviderTransaction.amount), else_=0)).label("matched"),
+            func.sum(func.case((ProviderTransaction.matched == 0, ProviderTransaction.amount), else_=0)).label("pending"),
+        ).where(ProviderTransaction.tenant_id == tenant_id)
+    )
+    prov_row = prov_agg.one()
     
-    # Recent activity (last 10)
-    recent_bank = sorted(
-        [{"id": b.id, "concept": b.concept, "amount": b.amount, "date": b.transaction_date.isoformat() if b.transaction_date else None, "matched": b.matched, "type": "bank"} for b in bank_txs],
-        key=lambda x: x["date"] or "",
-        reverse=True
-    )[:10]
+    total_bank = float(bank_row.total or 0)
+    total_provider = float(prov_row.total or 0)
+    matched_bank = float(bank_row.matched or 0)
+    pending_bank = float(bank_row.pending or 0)
+    pending_provider = float(prov_row.pending or 0)
     
-    recent_provider = sorted(
-        [{"id": p.id, "concept": p.concept, "amount": p.amount, "date": p.transaction_date.isoformat() if p.transaction_date else None, "matched": p.matched, "type": "provider", "provider_name": p.provider_name} for p in prov_txs],
-        key=lambda x: x["date"] or "",
-        reverse=True
-    )[:10]
+    # Recent activity (last 10 from each) — still need to load a small subset
+    recent_bank_result = await db.execute(
+        select(BankTransaction)
+        .where(BankTransaction.tenant_id == tenant_id)
+        .order_by(BankTransaction.transaction_date.desc())
+        .limit(10)
+    )
+    recent_bank = [
+        {"id": b.id, "concept": b.concept, "amount": b.amount, "date": b.transaction_date.isoformat() if b.transaction_date else None, "matched": b.matched, "type": "bank"}
+        for b in recent_bank_result.scalars().all()
+    ]
+    
+    recent_provider_result = await db.execute(
+        select(ProviderTransaction)
+        .where(ProviderTransaction.tenant_id == tenant_id)
+        .order_by(ProviderTransaction.transaction_date.desc())
+        .limit(10)
+    )
+    recent_provider = [
+        {"id": p.id, "concept": p.concept, "amount": p.amount, "date": p.transaction_date.isoformat() if p.transaction_date else None, "matched": p.matched, "type": "provider", "provider_name": p.provider_name}
+        for p in recent_provider_result.scalars().all()
+    ]
+    
+    # Unmatched for discrepancies section (limit to 50 to avoid huge payloads)
+    unmatched_bank_result = await db.execute(
+        select(BankTransaction)
+        .where(BankTransaction.tenant_id == tenant_id, BankTransaction.matched == 0)
+        .order_by(BankTransaction.transaction_date.desc())
+        .limit(50)
+    )
+    unmatched_provider_result = await db.execute(
+        select(ProviderTransaction)
+        .where(ProviderTransaction.tenant_id == tenant_id, ProviderTransaction.matched == 0)
+        .order_by(ProviderTransaction.transaction_date.desc())
+        .limit(50)
+    )
     
     return {
         "summary": {
@@ -220,13 +266,13 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
             "matched_amount": matched_bank,
             "missing_amount": abs(pending_provider) + abs(pending_bank),
             "collection_rate": (matched_bank / total_provider * 100) if total_provider else 0,
-            "bank_count": len(bank_txs),
-            "provider_count": len(prov_txs),
-            "matched_count": sum(1 for b in bank_txs if b.matched),
-            "pending_count": sum(1 for b in bank_txs if not b.matched) + sum(1 for p in prov_txs if not p.matched),
+            "bank_count": bank_row.count or 0,
+            "provider_count": prov_row.count or 0,
+            "matched_count": bank_row.matched_count or 0,
+            "pending_count": (bank_row.pending_count or 0) + (prov_row.count or 0) - (prov_row.matched or 0),
             # Aliases for frontend compatibility
-            "bank_transactions": len(bank_txs),
-            "provider_transactions": len(prov_txs),
+            "bank_transactions": bank_row.count or 0,
+            "provider_transactions": prov_row.count or 0,
             "matched_bank": matched_bank,
             "matched_provider": matched_bank,
             "pending_bank": pending_bank,
@@ -234,7 +280,13 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         },
         "recent_activity": recent_bank + recent_provider,
         "discrepancies": {
-            "unmatched_bank": [{"id": b.id, "concept": b.concept, "amount": b.amount, "date": b.transaction_date.isoformat() if b.transaction_date else None} for b in bank_txs if not b.matched],
-            "unmatched_provider": [{"id": p.id, "concept": p.concept, "amount": p.amount, "date": p.transaction_date.isoformat() if p.transaction_date else None, "provider_name": p.provider_name} for p in prov_txs if not p.matched],
+            "unmatched_bank": [
+                {"id": b.id, "concept": b.concept, "amount": b.amount, "date": b.transaction_date.isoformat() if b.transaction_date else None}
+                for b in unmatched_bank_result.scalars().all()
+            ],
+            "unmatched_provider": [
+                {"id": p.id, "concept": p.concept, "amount": p.amount, "date": p.transaction_date.isoformat() if p.transaction_date else None, "provider_name": p.provider_name}
+                for p in unmatched_provider_result.scalars().all()
+            ],
         }
     }
