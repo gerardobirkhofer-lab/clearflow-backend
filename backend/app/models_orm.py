@@ -195,11 +195,6 @@ class LocalCredential(Base, TimestampMixin):
 
 
 class Institution(Base, TenantMixin, TimestampMixin):
-
-    tenant: Mapped["Tenant"] = relationship(back_populates="users")
-
-
-class Institution(Base, TenantMixin, TimestampMixin):
     """A bank, acquirer, or clearing house."""
     __tablename__ = "institutions"
     __table_args__ = (
