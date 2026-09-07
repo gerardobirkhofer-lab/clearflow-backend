@@ -1,5 +1,5 @@
 """
-Authentication with real JWT validation + DB lookup using legacy User table.
+Authentication with real JWT validation + DB lookup using LocalAuthUser table.
 Falls back to demo user for invalid/missing tokens (backward-compatible).
 """
 from __future__ import annotations
@@ -39,7 +39,7 @@ DEMO_USER = CurrentUser(
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> CurrentUser:
-    """Decode JWT → lookup user in legacy DB → return CurrentUser.
+    """Decode JWT → lookup user in LocalAuthUser table → return CurrentUser.
     Falls back to DEMO_USER on any auth failure (backward compatibility)."""
     if not credentials:
         return DEMO_USER
@@ -58,14 +58,14 @@ async def get_current_user(
     except Exception:
         return DEMO_USER
 
-    # Lookup in legacy DB
+    # Lookup in LocalAuthUser table
     try:
         from app.core.database import SharedSessionLocal
-        from app.models.user import User as LegacyUser
+        from app.models.local_auth_user import LocalAuthUser
 
         async with SharedSessionLocal() as session:
             result = await session.execute(
-                select(LegacyUser).where(LegacyUser.id == int(user_id))
+                select(LocalAuthUser).where(LocalAuthUser.id == int(user_id))
             )
             user = result.scalar_one_or_none()
             if user is None:
