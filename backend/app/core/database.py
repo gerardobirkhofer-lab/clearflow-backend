@@ -179,50 +179,11 @@ async def init_db() -> None:
 
     try:
         async with shared_engine.begin() as conn:
-            # checkfirst=True is default, but we make it explicit for safety
             await conn.run_sync(lambda sync_conn: combined.create_all(sync_conn, checkfirst=True))
     except Exception as e:
-        # Log but don't crash — tables likely already exist
         import logging
         logger = logging.getLogger(__name__)
         logger.warning(f"DB init warning (tables likely exist): {e}")
-
-    # Ensure default tenant exists (required for demo user)
-    async with SharedSessionLocal() as session:
-        from app.models_orm import Tenant
-        result = await session.execute(
-            select(Tenant).where(Tenant.id == uuid.UUID("22222222-2222-2222-2222-222222222222"))
-        )
-        if result.scalar_one_or_none() is None:
-            default_tenant = Tenant(
-                id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
-                name="Default Tenant",
-                slug="default",
-                timezone="UTC",
-                currency="USD",
-                is_active=True,
-                subscription_plan="free",
-                tier="starter",
-            )
-            session.add(default_tenant)
-            await session.commit()
-    """Create all tables in the shared (meta) database on startup.
-    Combines legacy and new ORM tables, skipping duplicates."""
-    from app import models_orm as orm
-
-    combined = MetaData()
-
-    # Add legacy tables first (skip 'users' which conflicts with new ORM)
-    for name, table in Base.metadata.tables.items():
-        if name != "users":
-            table.tometadata(combined)
-
-    # Add new ORM tables
-    for name, table in orm.Base.metadata.tables.items():
-        table.tometadata(combined)
-
-    async with shared_engine.begin() as conn:
-        await conn.run_sync(combined.create_all)
 
     # Ensure default tenant exists (required for demo user)
     async with SharedSessionLocal() as session:

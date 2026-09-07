@@ -179,6 +179,26 @@ class User(Base, TenantMixin, TimestampMixin):
     tenant: Mapped["Tenant"] = relationship(back_populates="users")
 
 
+class LocalCredential(Base, TimestampMixin):
+    """Password hash for locally-authenticated users (separate table to avoid ALTER on users)."""
+    __tablename__ = "local_credentials"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID, primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+    )
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    user: Mapped["User"] = relationship()
+
+
+class Institution(Base, TenantMixin, TimestampMixin):
+
+    tenant: Mapped["Tenant"] = relationship(back_populates="users")
+
+
 class Institution(Base, TenantMixin, TimestampMixin):
     """A bank, acquirer, or clearing house."""
     __tablename__ = "institutions"
