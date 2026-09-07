@@ -18,6 +18,7 @@ pydantic = "^2.6.0"
 pydantic-settings = "^2.1.0"
 python-jose = {extras = ["cryptography"], version = "^3.3.0"}
 passlib = {extras = ["bcrypt"], version = "^1.7.0"}
+bcrypt = "^5.0.0"
 python-multipart = "^0.0.9"
 httpx = "^0.26.0"
 structlog = "^24.1.0"
