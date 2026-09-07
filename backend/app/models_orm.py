@@ -161,7 +161,7 @@ class Tenant(Base, TimestampMixin):
 
 class User(Base, TenantMixin, TimestampMixin):
     """A user within a tenant workspace."""
-    __tablename__ = "users"
+    __tablename__ = "cf_users"
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID, primary_key=True, default=uuid.uuid4
@@ -187,7 +187,7 @@ class LocalCredential(Base, TimestampMixin):
         UUID, primary_key=True, default=uuid.uuid4
     )
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
+        UUID, ForeignKey("cf_users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
     )
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
 
