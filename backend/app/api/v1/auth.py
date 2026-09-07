@@ -50,45 +50,51 @@ def _create_access_token(user_id: int, email: str) -> str:
 @router.post("/register", status_code=201)
 async def register(data: dict, request: Request):
     """Register a new user into the legacy users table."""
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
-    full_name = data.get("full_name") or data.get("name") or email.split("@")[0]
+    try:
+        email = (data.get("email") or "").strip().lower()
+        password = data.get("password") or ""
+        full_name = data.get("full_name") or data.get("name") or email.split("@")[0]
 
-    if not email or "@" not in email:
-        raise HTTPException(status_code=422, detail="Valid email required")
-    if len(password) < 6:
-        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+        if not email or "@" not in email:
+            raise HTTPException(status_code=422, detail="Valid email required")
+        if len(password) < 6:
+            raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
 
-    async with SharedSessionLocal() as session:
-        # Check existing user
-        from sqlalchemy import select
-        existing = await session.execute(select(LegacyUser).where(LegacyUser.email == email))
-        if existing.scalar_one_or_none():
-            raise HTTPException(status_code=409, detail="Email already registered")
+        async with SharedSessionLocal() as session:
+            # Check existing user
+            from sqlalchemy import select
+            existing = await session.execute(select(LegacyUser).where(LegacyUser.email == email))
+            if existing.scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="Email already registered")
 
-        # Create user in legacy table
-        user = LegacyUser(
-            email=email,
-            password_hash=_hash_password(password),
-            name=full_name,
-            role="self_owner",
-            is_active=1,
-        )
-        session.add(user)
-        await session.commit()
-        # Refresh to get the auto-generated id
-        await session.refresh(user)
+            # Create user in legacy table
+            user = LegacyUser(
+                email=email,
+                password_hash=_hash_password(password),
+                name=full_name,
+                role="self_owner",
+                is_active=1,
+            )
+            session.add(user)
+            await session.commit()
+            # Refresh to get the auto-generated id
+            await session.refresh(user)
 
-    token = _create_access_token(user.id, email)
-    return {
-        "token": token,
-        "user": {
-            "id": user.id,
-            "email": user.email,
-            "name": user.name,
-            "role": user.role,
-        },
-    }
+        token = _create_access_token(user.id, email)
+        return {
+            "token": token,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "name": user.name,
+                "role": user.role,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"DB ERROR: {type(e).__name__}: {str(e)} | {traceback.format_exc()[:500]}")
 
 
 @router.post("/login")
