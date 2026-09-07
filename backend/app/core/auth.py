@@ -1,5 +1,5 @@
 """
-Authentication with real JWT validation + DB lookup.
+Authentication with real JWT validation + DB lookup using legacy User table.
 Falls back to demo user for invalid/missing tokens (backward-compatible).
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ ALGORITHM = "HS256"
 
 
 class CurrentUser:
-    def __init__(self, id: uuid.UUID, email: str, tenant_id: uuid.UUID, role: str = "OWNER"):
+    def __init__(self, id, email: str, tenant_id: uuid.UUID, role: str = "OWNER"):
         self.id = id
         self.email = email
         self.tenant_id = tenant_id
@@ -29,7 +29,7 @@ class CurrentUser:
 
 # Demo fallback user (preserves existing sessions)
 DEMO_USER = CurrentUser(
-    id=uuid.UUID("11111111-1111-1111-1111-111111111111"),
+    id=1,
     email="demo@clearflow.local",
     tenant_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
     role="OWNER",
@@ -39,7 +39,7 @@ DEMO_USER = CurrentUser(
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> CurrentUser:
-    """Decode JWT → lookup user in DB → return CurrentUser.
+    """Decode JWT → lookup user in legacy DB → return CurrentUser.
     Falls back to DEMO_USER on any auth failure (backward compatibility)."""
     if not credentials:
         return DEMO_USER
@@ -52,22 +52,20 @@ async def get_current_user(
     try:
         import jwt
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id_str = payload.get("sub") or payload.get("user_id")
-        if not user_id_str:
+        user_id = payload.get("sub") or payload.get("user_id")
+        if user_id is None:
             return DEMO_USER
-        user_id = uuid.UUID(str(user_id_str))
     except Exception:
         return DEMO_USER
 
-    # Lookup in DB
+    # Lookup in legacy DB
     try:
-        # Lazy import to avoid circular deps at module load
         from app.core.database import SharedSessionLocal
-        from app.models_orm import User
+        from app.models.user import User as LegacyUser
 
         async with SharedSessionLocal() as session:
             result = await session.execute(
-                select(User).where(User.id == user_id)
+                select(LegacyUser).where(LegacyUser.id == int(user_id))
             )
             user = result.scalar_one_or_none()
             if user is None:
@@ -75,8 +73,8 @@ async def get_current_user(
             return CurrentUser(
                 id=user.id,
                 email=user.email,
-                tenant_id=user.tenant_id,
-                role=user.role.value if hasattr(user.role, "value") else str(user.role).upper(),
+                tenant_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
+                role=user.role.upper() if user.role else "OWNER",
             )
     except Exception:
         return DEMO_USER

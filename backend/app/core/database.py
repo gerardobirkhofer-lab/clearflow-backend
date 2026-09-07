@@ -168,9 +168,8 @@ async def init_db() -> None:
 
     combined = MetaData()
 
-    # Add legacy tables first (skip 'users' which conflicts with new ORM)
+    # Add legacy tables first
     for name, table in Base.metadata.tables.items():
-        if name != "users":
             table.tometadata(combined)
 
     # Add new ORM tables

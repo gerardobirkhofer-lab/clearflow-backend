@@ -145,7 +145,6 @@ class Tenant(Base, TimestampMixin):
     )
 
     # Relationships
-    users: Mapped[list["User"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
     institutions: Mapped[list["Institution"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
     collections: Mapped[list["CardCollection"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
     bank_movements: Mapped[list["BankMovement"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
@@ -157,41 +156,6 @@ class Tenant(Base, TimestampMixin):
     file_uploads: Mapped[list["FileUpload"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
     webhooks: Mapped[list["Webhook"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
     api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
-
-
-class User(Base, TenantMixin, TimestampMixin):
-    """A user within a tenant workspace."""
-    __tablename__ = "cf_users"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID, primary_key=True, default=uuid.uuid4
-    )
-    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-    full_name: Mapped[str | None] = mapped_column(String(255))
-    role: Mapped[UserRole] = mapped_column(ENUM(UserRole, name="user_role"), default=UserRole.VIEWER)
-    auth_provider: Mapped[str] = mapped_column(String(50), default="auth0")  # auth0, clerk, local
-    auth_subject: Mapped[str | None] = mapped_column(String(255), index=True)  # External auth ID
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    notification_email: Mapped[bool] = mapped_column(Boolean, default=True)
-    notification_webhook: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    tenant: Mapped["Tenant"] = relationship(back_populates="users")
-
-
-class LocalCredential(Base, TimestampMixin):
-    """Password hash for locally-authenticated users (separate table to avoid ALTER on users)."""
-    __tablename__ = "local_credentials"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID, primary_key=True, default=uuid.uuid4
-    )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID, ForeignKey("cf_users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
-    )
-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    user: Mapped["User"] = relationship()
 
 
 class Institution(Base, TenantMixin, TimestampMixin):

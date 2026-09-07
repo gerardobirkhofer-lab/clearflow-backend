@@ -1,21 +1,19 @@
 """
-Authentication endpoints — real local auth with bcrypt.
+Authentication endpoints — real local auth with bcrypt using legacy User table.
 Backward-compatible: demo token still works as fallback.
 """
 from __future__ import annotations
 
 import os
-import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from passlib.context import CryptContext
-from sqlalchemy import select
+import bcrypt
 import jwt
 
 from app.core.database import SharedSessionLocal
-from app.models_orm import User, Tenant, LocalCredential, UserRole
+from app.models.user import User as LegacyUser
 
 router = APIRouter()
 
@@ -23,16 +21,25 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clearflow-secret-key-change-in-product
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 
-def _create_access_token(user_id: uuid.UUID, email: str) -> str:
+def _hash_password(password: str) -> str:
+    """Hash a password with bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt(rounds=12)).decode('utf-8')
+
+
+def _verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against a bcrypt hash."""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+
+def _create_access_token(user_id: int, email: str) -> str:
     """Encode a JWT with user claims."""
     now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
-        "user_id": str(user_id),
+        "user_id": user_id,
         "email": email,
         "iat": now,
         "exp": now + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS),
@@ -42,7 +49,7 @@ def _create_access_token(user_id: uuid.UUID, email: str) -> str:
 
 @router.post("/register", status_code=201)
 async def register(data: dict, request: Request):
-    """Register a new owner user + tenant + local credentials."""
+    """Register a new user into the legacy users table."""
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
     full_name = data.get("full_name") or data.get("name") or email.split("@")[0]
@@ -54,57 +61,32 @@ async def register(data: dict, request: Request):
 
     async with SharedSessionLocal() as session:
         # Check existing user
-        existing = await session.execute(select(User).where(User.email == email))
+        from sqlalchemy import select
+        existing = await session.execute(select(LegacyUser).where(LegacyUser.email == email))
         if existing.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Email already registered")
 
-        # Create tenant
-        tenant_slug = f"t-{uuid.uuid4().hex[:8]}"
-        tenant = Tenant(
-            id=uuid.uuid4(),
-            name=data.get("company_name") or full_name,
-            slug=tenant_slug,
-            timezone="Europe/Madrid",
-            currency="EUR",
-            is_active=True,
-            subscription_plan="free",
-            tier="starter",
-        )
-        session.add(tenant)
-        await session.flush()  # get tenant.id
-
-        # Create user
-        user = User(
-            id=uuid.uuid4(),
+        # Create user in legacy table
+        user = LegacyUser(
             email=email,
-            full_name=full_name,
-            role=UserRole.OWNER,
-            auth_provider="local",
-            tenant_id=tenant.id,
-            is_active=True,
+            password_hash=_hash_password(password),
+            name=full_name,
+            role="self_owner",
+            is_active=1,
         )
         session.add(user)
-        await session.flush()  # get user.id
-
-        # Create local credential
-        cred = LocalCredential(
-            id=uuid.uuid4(),
-            user_id=user.id,
-            password_hash=pwd_context.hash(password),
-        )
-        session.add(cred)
-
         await session.commit()
+        # Refresh to get the auto-generated id
+        await session.refresh(user)
 
     token = _create_access_token(user.id, email)
     return {
         "token": token,
         "user": {
-            "id": str(user.id),
+            "id": user.id,
             "email": user.email,
-            "name": user.full_name,
-            "role": user.role.value,
-            "tenant_id": str(tenant.id),
+            "name": user.name,
+            "role": user.role,
         },
     }
 
@@ -119,33 +101,22 @@ async def login(data: dict):
         raise HTTPException(status_code=422, detail="Email and password required")
 
     async with SharedSessionLocal() as session:
-        result = await session.execute(select(User).where(User.email == email))
+        from sqlalchemy import select
+        result = await session.execute(select(LegacyUser).where(LegacyUser.email == email))
         user = result.scalar_one_or_none()
         if user is None:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        result = await session.execute(
-            select(LocalCredential).where(LocalCredential.user_id == user.id)
-        )
-        cred = result.scalar_one_or_none()
-        if cred is None:
+        if not _verify_password(password, user.password_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        if not pwd_context.verify(password, cred.password_hash):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        # Update last login
-        user.last_login_at = datetime.now(timezone.utc)
-        await session.commit()
 
     token = _create_access_token(user.id, user.email)
     return {
         "token": token,
         "user": {
-            "id": str(user.id),
+            "id": user.id,
             "email": user.email,
-            "name": user.full_name,
-            "role": user.role.value if hasattr(user.role, "value") else str(user.role),
-            "tenant_id": str(user.tenant_id),
+            "name": user.name,
+            "role": user.role,
         },
     }
