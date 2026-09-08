@@ -47,7 +47,7 @@ async def connect_stripe_direct(
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
-    # Validate the API key with Stripe
+    # Validate the API key with Stripe (single clean attempt)
     try:
         original_key = stripe.api_key
         stripe.api_key = api_key
@@ -60,15 +60,6 @@ async def connect_stripe_direct(
         raise HTTPException(status_code=401, detail="Invalid Stripe API key. Please check and try again.")
     except Exception as e:
         stripe.api_key = original_key
-        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
-    try:
-        temp_stripe = stripe.StripeClient(api_key)
-        account = temp_stripe.accounts.retrieve()
-        account_id = account.id
-        account_email = getattr(account, 'email', '') or ''
-    except stripe.error.AuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid Stripe API key. Please check and try again.")
-    except Exception as e:
         raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
 
     # Save or update connection
