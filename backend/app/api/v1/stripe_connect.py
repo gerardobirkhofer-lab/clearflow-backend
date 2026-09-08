@@ -49,6 +49,19 @@ async def connect_stripe_direct(
 
     # Validate the API key with Stripe
     try:
+        original_key = stripe.api_key
+        stripe.api_key = api_key
+        account = stripe.Account.retrieve()
+        account_id = account.id
+        account_email = getattr(account, 'email', '') or ''
+        stripe.api_key = original_key
+    except stripe.error.AuthenticationError:
+        stripe.api_key = original_key
+        raise HTTPException(status_code=401, detail="Invalid Stripe API key. Please check and try again.")
+    except Exception as e:
+        stripe.api_key = original_key
+        raise HTTPException(status_code=400, detail=f"Stripe error: {str(e)}")
+    try:
         temp_stripe = stripe.StripeClient(api_key)
         account = temp_stripe.accounts.retrieve()
         account_id = account.id
