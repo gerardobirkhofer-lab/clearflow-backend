@@ -35,6 +35,7 @@ from .api.v1 import (
     uploads,
     webhooks,
     dashboard,
+    stripe_connect,
 )
 
 logger = structlog.get_logger()
@@ -155,6 +156,7 @@ def create_app() -> FastAPI:
     app.include_router(uploads.router, prefix="/api/v1", tags=["uploads"])
     app.include_router(webhooks.router, prefix="/api/v1", tags=["webhooks"])
     app.include_router(dashboard.router, prefix="/api/v1", tags=["dashboard"])
+    app.include_router(stripe_connect.router, prefix="/api/v1/stripe", tags=["stripe"])
 
     return app
 
