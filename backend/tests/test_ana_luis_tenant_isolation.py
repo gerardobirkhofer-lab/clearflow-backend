@@ -134,6 +134,31 @@ def test_ana_does_not_see_luis_money(client: TestClient):
     assert _money(luis_body, "today_collections") == Decimal("1800")
     assert _money(luis_body, "yesterday_collections") == Decimal("4200")
 
+    anonymous_panel = client.get(
+        "/api/v1/bank-statements/dashboard",
+        params={"tenant_id": luis["user"]["tenant_id"]},
+    )
+    assert anonymous_panel.status_code == 401
+
+    ana_panel = client.get(
+        "/api/v1/bank-statements/dashboard",
+        params={"tenant_id": luis["user"]["tenant_id"]},
+        headers=ana_headers,
+    )
+    luis_panel = client.get("/api/v1/bank-statements/dashboard", headers=luis_headers)
+    assert ana_panel.status_code == 200
+    assert luis_panel.status_code == 200
+    assert _money(ana_panel.json()["summary"], "total_collected") == 0
+    assert _money(luis_panel.json()["summary"], "total_collected") == Decimal("4200")
+
+    ana_status = client.get(
+        "/api/v1/reconciliation/status",
+        params={"tenant_id": luis["user"]["tenant_id"]},
+        headers=ana_headers,
+    )
+    assert ana_status.status_code == 200
+    assert ana_status.json()["bank_transactions"] == 0
+
     spoofed = client.get(
         "/api/v1/dashboard/summary",
         params={"tenant_id": luis["user"]["tenant_id"]},
