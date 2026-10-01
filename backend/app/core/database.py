@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import select, MetaData
+from sqlalchemy import select, MetaData, text
 
 from .config import get_settings
 from .auth import get_current_user, CurrentUser
@@ -179,6 +179,27 @@ async def init_db() -> None:
     try:
         async with shared_engine.begin() as conn:
             await conn.run_sync(lambda sync_conn: combined.create_all(sync_conn, checkfirst=True))
+            await conn.execute(text(
+                """
+                DO $$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'cf_local_users'
+                  ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'cf_local_users'
+                      AND column_name = 'tenant_id'
+                  ) THEN
+                    ALTER TABLE cf_local_users ADD COLUMN tenant_id UUID;
+                    CREATE INDEX IF NOT EXISTS ix_cf_local_users_tenant_id
+                      ON cf_local_users (tenant_id);
+                  END IF;
+                END
+                $$;
+                """
+            ))
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)

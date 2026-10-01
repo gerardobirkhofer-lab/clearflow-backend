@@ -6,6 +6,7 @@ from __future__ import annotations
 from sqlalchemy import Column, Integer, String, DateTime
 from sqlalchemy.sql import func
 from app.core.database import Base
+from app.core.uuid_type import UUID
 
 
 class LocalAuthUser(Base):
@@ -18,4 +19,5 @@ class LocalAuthUser(Base):
     name = Column(String(100), nullable=False)
     role = Column(String(50), default="self_owner")
     is_active = Column(Integer, default=1)
+    tenant_id = Column(UUID, nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now())

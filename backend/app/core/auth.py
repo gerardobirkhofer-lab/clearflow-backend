@@ -1,6 +1,7 @@
 """
-Authentication with real JWT validation + DB lookup using LocalAuthUser table.
-Falls back to demo user for invalid/missing tokens (backward-compatible).
+Authentication with JWT validation and a database lookup on cf_local_users.
+
+The tenant always comes from the user row. A missing or invalid token is 401.
 """
 from __future__ import annotations
 
@@ -11,7 +12,6 @@ from typing import Optional
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 security = HTTPBearer(auto_error=False)
 
@@ -27,57 +27,59 @@ class CurrentUser:
         self.role = role
 
 
-# Demo fallback user (preserves existing sessions)
-DEMO_USER = CurrentUser(
-    id=1,
-    email="demo@clearflow.local",
-    tenant_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
-    role="OWNER",
-)
+def _unauthorized() -> None:
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> CurrentUser:
-    """Decode JWT → lookup user in LocalAuthUser table → return CurrentUser.
-    Falls back to DEMO_USER on any auth failure (backward compatibility)."""
-    if not credentials:
-        return DEMO_USER
+    """Decode JWT, load the user, and take tenant_id from the database."""
+    if credentials is None:
+        _unauthorized()
 
     token = credentials.credentials
     if not token or token in ("null", "undefined", ""):
-        return DEMO_USER
+        _unauthorized()
 
-    # Try JWT decode
     try:
         import jwt
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = payload.get("sub") or payload.get("user_id")
-        if user_id is None:
-            return DEMO_USER
     except Exception:
-        return DEMO_USER
+        _unauthorized()
 
-    # Lookup in LocalAuthUser table
+    user_id = payload.get("sub") or payload.get("user_id")
     try:
-        from app.core.database import SharedSessionLocal
-        from app.models.local_auth_user import LocalAuthUser
+        user_id_int = int(user_id)
+    except (TypeError, ValueError):
+        _unauthorized()
 
-        async with SharedSessionLocal() as session:
-            result = await session.execute(
-                select(LocalAuthUser).where(LocalAuthUser.id == int(user_id))
-            )
-            user = result.scalar_one_or_none()
-            if user is None:
-                return DEMO_USER
-            return CurrentUser(
-                id=user.id,
-                email=user.email,
-                tenant_id=uuid.UUID("22222222-2222-2222-2222-222222222222"),
-                role=user.role.upper() if user.role else "OWNER",
-            )
-    except Exception:
-        return DEMO_USER
+    from app.core.database import SharedSessionLocal
+    from app.models.local_auth_user import LocalAuthUser
+
+    async with SharedSessionLocal() as session:
+        result = await session.execute(
+            select(LocalAuthUser).where(LocalAuthUser.id == user_id_int)
+        )
+        user = result.scalar_one_or_none()
+
+    if user is None or user.tenant_id is None:
+        _unauthorized()
+
+    tenant_id = user.tenant_id
+    if not isinstance(tenant_id, uuid.UUID):
+        tenant_id = uuid.UUID(str(tenant_id))
+
+    return CurrentUser(
+        id=user.id,
+        email=user.email,
+        tenant_id=tenant_id,
+        role=user.role.upper() if user.role else "OWNER",
+    )
 
 
 def require_role(allowed_roles: list[str]):

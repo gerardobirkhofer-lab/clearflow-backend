@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,12 +32,10 @@ router = APIRouter(prefix="/dashboard")
 async def get_dashboard_summary(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
-    tenant_id_override: UUID | None = Query(None, alias="tenant_id"),
     tenant_id: UUID = Depends(get_current_tenant),
 ):
-    """Get dashboard key metrics from legacy transaction tables.
-    Supports tenant_id override via query param for demo mode."""
-    effective_tenant_id = tenant_id_override or tenant_id
+    """Get dashboard key metrics for the authenticated user's tenant."""
+    effective_tenant_id = tenant_id
 
     # --- Provider transactions (sales/collections) ALL TIME ---
     prov_total_query = select(func.sum(ProviderTransaction.amount)).where(
