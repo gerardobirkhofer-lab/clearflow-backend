@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
 )
 from sqlalchemy.orm import declarative_base
-from sqlalchemy import select, MetaData
+from sqlalchemy import select, MetaData, text
 
 from .config import get_settings
 from .auth import get_current_user, CurrentUser
@@ -147,7 +147,7 @@ tenant_db_manager = TenantDBManager(shared_engine)
 async def get_db(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> AsyncGenerator[AsyncSession, None]:
-    """Yield an AsyncSession from the shared DB (demo mode)."""
+    """Yield an AsyncSession from the shared database."""
     async with SharedSessionLocal() as session:
         yield session
 
@@ -184,7 +184,18 @@ async def init_db() -> None:
         logger = logging.getLogger(__name__)
         logger.warning(f"DB init warning (tables likely exist): {e}")
 
-    # Ensure default tenant exists (required for demo user)
+    # Existing databases were created before cf_local_users.tenant_id existed.
+    try:
+        tenant_col = "UUID" if shared_engine.dialect.name == "postgresql" else "CHAR(36)"
+        async with shared_engine.begin() as conn:
+            await conn.execute(text(
+                f"ALTER TABLE cf_local_users ADD COLUMN IF NOT EXISTS tenant_id {tenant_col}"
+            ))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"tenant_id column migration skipped: {e}")
+
+    # Historical shared workspace. Authentication must not assign users to it.
     async with SharedSessionLocal() as session:
         from app.models_orm import Tenant
         result = await session.execute(
