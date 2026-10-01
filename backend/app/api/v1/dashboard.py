@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,28 +32,25 @@ router = APIRouter(prefix="/dashboard")
 async def get_dashboard_summary(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
-    tenant_id_override: UUID | None = Query(None, alias="tenant_id"),
     tenant_id: UUID = Depends(get_current_tenant),
 ):
-    """Get dashboard key metrics from legacy transaction tables.
-    Supports tenant_id override via query param for demo mode."""
-    effective_tenant_id = tenant_id_override or tenant_id
+    """Get dashboard key metrics from legacy transaction tables."""
 
     # --- Provider transactions (sales/collections) ALL TIME ---
     prov_total_query = select(func.sum(ProviderTransaction.amount)).where(
-        ProviderTransaction.tenant_id == effective_tenant_id
+        ProviderTransaction.tenant_id == tenant_id
     )
     prov_total = await db.scalar(prov_total_query) or 0
 
     # --- Bank transactions ALL TIME ---
     bank_total_query = select(func.sum(BankTransaction.amount)).where(
-        BankTransaction.tenant_id == effective_tenant_id
+        BankTransaction.tenant_id == tenant_id
     )
     bank_total = await db.scalar(bank_total_query) or 0
 
     bank_matched_query = select(func.sum(BankTransaction.amount)).where(
         and_(
-            BankTransaction.tenant_id == effective_tenant_id,
+            BankTransaction.tenant_id == tenant_id,
             BankTransaction.matched == 1,
         )
     )
@@ -61,7 +58,7 @@ async def get_dashboard_summary(
 
     bank_unmatched_query = select(func.sum(BankTransaction.amount)).where(
         and_(
-            BankTransaction.tenant_id == effective_tenant_id,
+            BankTransaction.tenant_id == tenant_id,
             BankTransaction.matched == 0,
         )
     )
@@ -69,7 +66,7 @@ async def get_dashboard_summary(
 
     prov_matched_query = select(func.sum(ProviderTransaction.amount)).where(
         and_(
-            ProviderTransaction.tenant_id == effective_tenant_id,
+            ProviderTransaction.tenant_id == tenant_id,
             ProviderTransaction.matched == 1,
         )
     )
@@ -77,7 +74,7 @@ async def get_dashboard_summary(
 
     prov_unmatched_query = select(func.sum(ProviderTransaction.amount)).where(
         and_(
-            ProviderTransaction.tenant_id == effective_tenant_id,
+            ProviderTransaction.tenant_id == tenant_id,
             ProviderTransaction.matched == 0,
         )
     )
@@ -86,7 +83,7 @@ async def get_dashboard_summary(
     # Latest bank balance (from most recent bank transaction with balance)
     balance_query = select(BankTransaction.balance).where(
         and_(
-            BankTransaction.tenant_id == effective_tenant_id,
+            BankTransaction.tenant_id == tenant_id,
             BankTransaction.balance != None,
         )
     ).order_by(BankTransaction.transaction_date.desc()).limit(1)
@@ -97,7 +94,7 @@ async def get_dashboard_summary(
     # Discrepancy count from reconciliation results
     discrepancy_query = select(func.count()).where(
         and_(
-            ReconciliationResult.tenant_id == effective_tenant_id,
+            ReconciliationResult.tenant_id == tenant_id,
             ReconciliationResult.status == ReconciliationStatus.DISCREPANCY,
             ReconciliationResult.resolved == False,
         )
@@ -108,7 +105,7 @@ async def get_dashboard_summary(
     uncleared_bank = await db.scalar(
         select(func.count()).where(
             and_(
-                BankTransaction.tenant_id == effective_tenant_id,
+                BankTransaction.tenant_id == tenant_id,
                 BankTransaction.matched == 0,
             )
         )
@@ -116,7 +113,7 @@ async def get_dashboard_summary(
     uncleared_provider = await db.scalar(
         select(func.count()).where(
             and_(
-                ProviderTransaction.tenant_id == effective_tenant_id,
+                ProviderTransaction.tenant_id == tenant_id,
                 ProviderTransaction.matched == 0,
             )
         )
