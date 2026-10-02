@@ -226,6 +226,7 @@ async def get_dashboard(
             func.sum(ProviderTransaction.amount).label("total"),
             func.sum(func.case((ProviderTransaction.matched == 1, ProviderTransaction.amount), else_=0)).label("matched"),
             func.sum(func.case((ProviderTransaction.matched == 0, ProviderTransaction.amount), else_=0)).label("pending"),
+            func.sum(func.case((ProviderTransaction.matched == 0, 1), else_=0)).label("pending_count"),
         ).where(ProviderTransaction.tenant_id == tenant_id)
     )
     prov_row = prov_agg.one()
@@ -283,7 +284,7 @@ async def get_dashboard(
             "bank_count": bank_row.count or 0,
             "provider_count": prov_row.count or 0,
             "matched_count": bank_row.matched_count or 0,
-            "pending_count": (bank_row.pending_count or 0) + (prov_row.count or 0) - (prov_row.matched or 0),
+            "pending_count": int(bank_row.pending_count or 0) + int(prov_row.pending_count or 0),
             # Aliases for frontend compatibility
             "bank_transactions": bank_row.count or 0,
             "provider_transactions": prov_row.count or 0,
