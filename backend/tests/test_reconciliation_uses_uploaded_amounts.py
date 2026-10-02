@@ -94,3 +94,15 @@ def test_upload_and_reconcile_reports_file_amounts():
         concepts = {row["concept"] for row in status_body["unmatched_bank"]}
         assert "STRIPE PAYOUT" not in concepts
         assert "TRANSFERENCIA RECIBIDA CLIENTE A" in concepts
+
+        dashboard = client.get(
+            "/api/v1/bank-statements/dashboard",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+        )
+        assert dashboard.status_code == 200, dashboard.text
+        dash_summary = dashboard.json()["summary"]
+        assert dash_summary["bank_transactions"] == 5
+        assert dash_summary["matched_count"] == 1
+        assert round(dash_summary["matched_amount"], 2) == 890.0
+        assert dash_summary["pending_count"] == 4
