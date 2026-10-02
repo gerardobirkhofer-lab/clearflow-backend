@@ -5,7 +5,9 @@ from sqlalchemy import select, func, and_, text
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.tenant_access import bind_tenant
 from app.models.bank_transaction import BankTransaction
 from app.models.provider_transaction import ProviderTransaction
 
@@ -15,8 +17,10 @@ router = APIRouter()
 @router.post("/run")
 async def run_reconciliation(
     tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    tenant_id = bind_tenant(current_user, tenant_id)
     """
     Scalable reconciliation engine.
     Loads only lightweight tuples, indexes by amount, processes in batches,
@@ -208,7 +212,12 @@ async def run_reconciliation(
 
 
 @router.get("/status")
-async def get_reconciliation_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_reconciliation_status(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     bank_result = await db.execute(
         select(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
     )

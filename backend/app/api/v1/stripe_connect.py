@@ -1,11 +1,16 @@
 import uuid
 import os
 import stripe
-from datetime import datetime, timedelta
+import jwt
+from datetime import datetime, timedelta, timezone
+from app.core.secrets import jwt_secret
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from app.core.database import get_db
+from app.core.auth import CurrentUser, get_current_user
+from app.core.database import SharedSessionLocal, get_db
+from app.core.secrets import decrypt_secret, encrypt_secret
+from app.core.tenant_access import bind_tenant
 from app.models.provider_connection import ProviderConnection
 from app.models.provider_transaction import ProviderTransaction
 from app.models_orm import Tenant
@@ -24,7 +29,8 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 @router.post("/connect-direct")
 async def connect_stripe_direct(
     data: dict,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     Connect a Stripe account using a direct API key (sk_live_... or sk_test_...).
@@ -40,6 +46,7 @@ async def connect_stripe_direct(
         tenant_id = uuid.UUID(tenant_id_str)
     except ValueError:
         raise HTTPException(status_code=422, detail="Invalid tenant_id")
+    tenant_id = bind_tenant(current_user, tenant_id)
 
     # Verify tenant exists
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
@@ -71,7 +78,7 @@ async def connect_stripe_direct(
 
     if existing:
         existing.account_id = account_id
-        existing.access_token = api_key
+        existing.access_token = encrypt_secret(api_key)
         existing.status = "connected"
         existing.extra_data = {
             "mode": "direct_api_key",
@@ -82,7 +89,7 @@ async def connect_stripe_direct(
             tenant_id=tenant_id,
             provider_name="stripe",
             account_id=account_id,
-            access_token=api_key,
+            access_token=encrypt_secret(api_key),
             status="connected",
             extra_data={"mode": "direct_api_key", "account_email": account_email}
         )
@@ -99,7 +106,12 @@ async def connect_stripe_direct(
 
 
 @router.get("/status/{tenant_id}")
-async def get_stripe_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_stripe_status(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     result = await db.execute(select(ProviderConnection).where(
         ProviderConnection.tenant_id == tenant_id,
         ProviderConnection.provider_name == "stripe"
@@ -119,7 +131,12 @@ async def get_stripe_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
 
 
 @router.post("/sync/{tenant_id}")
-async def manual_sync(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def manual_sync(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     """
     Manually trigger a full sync of Stripe balance transactions for a tenant.
     Supports both OAuth (Connect) and direct API key modes.
@@ -133,7 +150,7 @@ async def manual_sync(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Stripe not connected. Please connect your Stripe account first.")
 
     mode = (conn.extra_data or {}).get("mode", "oauth")
-    api_key = conn.access_token
+    api_key = decrypt_secret(conn.access_token)
 
     # Use the tenant's own API key for direct mode, or our platform key + stripe_account for OAuth
     if mode == "direct_api_key":
@@ -225,7 +242,12 @@ async def manual_sync(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/disconnect/{tenant_id}")
-async def disconnect_stripe(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def disconnect_stripe(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     """Remove Stripe connection for a tenant."""
     result = await db.execute(select(ProviderConnection).where(
         ProviderConnection.tenant_id == tenant_id,
@@ -244,74 +266,119 @@ async def disconnect_stripe(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/connect-url")
-async def get_stripe_connect_url(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_stripe_connect_url(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     if not STRIPE_CLIENT_ID:
         raise HTTPException(status_code=500, detail="Stripe Connect not configured")
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    url = f"https://connect.stripe.com/oauth/authorize?response_type=code&client_id={STRIPE_CLIENT_ID}&scope=read_only&state={tenant_id}"
+    state = jwt.encode(
+        {
+            "tenant_id": str(tenant_id),
+            "purpose": "stripe_oauth",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=15),
+        },
+        jwt_secret(),
+        algorithm="HS256",
+    )
+    url = f"https://connect.stripe.com/oauth/authorize?response_type=code&client_id={STRIPE_CLIENT_ID}&scope=read_only&state={state}"
     return {"url": url}
 
 
 @router.get("/callback")
-async def stripe_callback(code: str, state: str, db: AsyncSession = Depends(get_db)):
+async def stripe_callback(code: str, state: str):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=500, detail="Stripe not configured")
-    tenant_id = uuid.UUID(state)
+    try:
+        claims = jwt.decode(state, jwt_secret(), algorithms=["HS256"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    if claims.get("purpose") != "stripe_oauth":
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+    tenant_id = uuid.UUID(claims["tenant_id"])
     try:
         response = stripe.oauth.token(grant_type="authorization_code", code=code)
-        stripe_user_id = response.get("stripe_user_id")
-        access_token = response.get("access_token")
-
+    except stripe.error.OAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    stripe_user_id = response.get("stripe_user_id")
+    access_token = response.get("access_token")
+    async with SharedSessionLocal() as db:
         result = await db.execute(select(ProviderConnection).where(
             ProviderConnection.tenant_id == tenant_id,
             ProviderConnection.provider_name == "stripe"
         ))
         existing = result.scalar_one_or_none()
-
         if existing:
             existing.account_id = stripe_user_id
-            existing.access_token = access_token
+            existing.access_token = encrypt_secret(access_token or "")
             existing.status = "connected"
             existing.extra_data = {"mode": "oauth", "scope": response.get("scope", "")}
         else:
-            conn = ProviderConnection(
+            db.add(ProviderConnection(
                 tenant_id=tenant_id,
                 provider_name="stripe",
                 account_id=stripe_user_id,
-                access_token=access_token,
+                access_token=encrypt_secret(access_token or ""),
                 status="connected",
                 extra_data={"mode": "oauth", "scope": response.get("scope", "")}
-            )
-            db.add(conn)
+            ))
         await db.commit()
-        return {"status": "success", "account_id": stripe_user_id}
-    except stripe.error.OAuthError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    return {"status": "success", "account_id": stripe_user_id}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Webhooks (kept for future use)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@router.post("/checkout-sessions", status_code=201)
+async def create_checkout_session(
+    data: dict,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Start a subscription checkout for the caller's own tenant."""
+    plan = (data.get("plan") or "").strip().lower()
+    price_env = {"pro": "STRIPE_PRICE_PRO", "enterprise": "STRIPE_PRICE_ENTERPRISE"}.get(plan)
+    if price_env is None:
+        raise HTTPException(status_code=422, detail="plan must be pro or enterprise")
+    price_id = os.getenv(price_env, "").strip()
+    if not STRIPE_SECRET_KEY or not price_id:
+        raise HTTPException(status_code=503, detail="Billing is not configured")
+    stripe.api_key = STRIPE_SECRET_KEY
+    frontend = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer_email=current_user.email,
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{frontend}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{frontend}/payment-cancel",
+        client_reference_id=str(current_user.tenant_id),
+        metadata={"tenant_id": str(current_user.tenant_id), "plan": plan},
+    )
+    return {"id": session.id, "url": session.url}
+
+
 @router.post("/webhook")
-async def stripe_webhook(request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
-
-    if STRIPE_WEBHOOK_SECRET and sig_header:
-        try:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid payload")
-        except stripe.error.SignatureVerificationError:
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        event = await request.json()
+    if not STRIPE_WEBHOOK_SECRET or not sig_header:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
     event_type = event.get("type")
+    if event_type == "checkout.session.completed":
+        await _apply_checkout(event.get("data", {}).get("object") or {})
 
     if event_type in ["payout.paid", "payout.created"]:
         account_id = event.get("account")
@@ -320,6 +387,28 @@ async def stripe_webhook(request: Request, background_tasks: BackgroundTasks, db
             background_tasks.add_task(_sync_single_payout_oauth, account_id, payout_id)
 
     return {"status": "received"}
+
+
+async def _apply_checkout(session_obj: dict) -> None:
+    """Set the paid plan on the tenant named in the Checkout metadata."""
+    from app.models_orm import Tenant, TenantTier
+
+    metadata = session_obj.get("metadata") or {}
+    plan = (metadata.get("plan") or "").lower()
+    tenant_raw = metadata.get("tenant_id")
+    if plan not in ("pro", "enterprise", "starter") or not tenant_raw:
+        return
+    try:
+        tenant_id = uuid.UUID(tenant_raw)
+    except ValueError:
+        return
+    async with SharedSessionLocal() as db:
+        tenant = await db.get(Tenant, tenant_id)
+        if tenant is None:
+            return
+        tenant.subscription_plan = plan
+        tenant.tier = TenantTier(plan)
+        await db.commit()
 
 
 async def _sync_single_payout_oauth(account_id: str, payout_id: str):

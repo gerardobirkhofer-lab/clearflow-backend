@@ -19,7 +19,9 @@ import structlog
 from .core.config import get_settings
 from .core.database import shared_engine, init_db
 from .core.redis import get_redis
+from .core.secrets import assert_production_secrets
 from .api.v1 import (
+    account,
     auth,
     tenants,
     institutions,
@@ -45,6 +47,7 @@ logger = structlog.get_logger()
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan events: startup and shutdown."""
     # Startup
+    assert_production_secrets()
     settings = get_settings()
     logger.info("app_starting", environment=settings.ENVIRONMENT)
 
@@ -83,16 +86,17 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     # CORS
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-    allow_origins = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://clearflow-demo.vercel.app",
-        "https://clearflow-frontend-rust.vercel.app",
-        "https://clearflow-frontend-vbzt.onrender.com",
-    ]
-    if frontend_url and frontend_url not in allow_origins:
-        allow_origins.append(frontend_url)
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    if os.getenv("ENVIRONMENT", "development") == "production":
+        allow_origins = [frontend_url] if frontend_url else []
+    else:
+        allow_origins = [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+        ]
+        if frontend_url and frontend_url not in allow_origins:
+            allow_origins.append(frontend_url)
 
     app.add_middleware(
         CORSMiddleware,
@@ -142,6 +146,7 @@ def create_app() -> FastAPI:
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+    app.include_router(account.router, prefix="/api/v1/account", tags=["account"])
     app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])

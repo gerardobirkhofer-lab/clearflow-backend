@@ -198,7 +198,7 @@ class TenantTier(str, PyEnum):
 
 class TenantCreate(BaseModel):
     name: str
-    slug: str
+    slug: str | None = None
     timezone: str = "Europe/Madrid"
     currency: str = "EUR"
     tier: TenantTier = TenantTier.STARTER
@@ -220,8 +220,6 @@ class TenantResponse(BaseModel):
     subscription_plan: str
     subscription_expires_at: datetime | None = None
     tier: TenantTier
-    database_url: str | None = None
-    database_name: str | None = None
     created_at: datetime
     updated_at: datetime
     model_config = ConfigDict(from_attributes=True)

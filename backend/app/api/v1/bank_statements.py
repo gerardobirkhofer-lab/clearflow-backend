@@ -6,7 +6,9 @@ import csv
 import io
 from datetime import datetime
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.tenant_access import bind_tenant
 from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
 
@@ -18,8 +20,10 @@ BATCH_SIZE = 500  # Commit every N transactions to avoid memory/time issues
 async def upload_statement(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    tenant_id = bind_tenant(current_user, tenant_id)
     # Verify tenant exists
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
@@ -162,7 +166,12 @@ def _parse_date(val):
     return None
 
 @router.get("/")
-async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_transactions(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     result = await db.execute(
         select(BankTransaction)
         .where(BankTransaction.tenant_id == tenant_id)
@@ -188,7 +197,12 @@ async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
     }
 
 @router.get("/dashboard")
-async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_dashboard(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     from app.models.provider_transaction import ProviderTransaction
     
     # Use SQL aggregation instead of loading all transactions into memory

@@ -2,14 +2,20 @@ from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
 from app.models.bank_account import BankAccount
 
 router = APIRouter()
 
 @router.post("/", status_code=201)
-async def create_bank_account(data: dict, db: AsyncSession = Depends(get_db)):
+async def create_bank_account(
+    data: dict,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     account = BankAccount(
+        tenant_id=current_user.tenant_id,
         name=data.get("name"),
         bank_name=data.get("bank_name"),
         account_number=data.get("account_number"),
@@ -32,8 +38,15 @@ async def create_bank_account(data: dict, db: AsyncSession = Depends(get_db)):
     }
 
 @router.get("/")
-async def list_bank_accounts(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(BankAccount).where(BankAccount.is_active == 1).order_by(desc(BankAccount.created_at)))
+async def list_bank_accounts(
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(BankAccount)
+        .where(BankAccount.is_active == 1, BankAccount.tenant_id == current_user.tenant_id)
+        .order_by(desc(BankAccount.created_at))
+    )
     accounts = result.scalars().all()
     return {
         "accounts": [
@@ -51,8 +64,17 @@ async def list_bank_accounts(db: AsyncSession = Depends(get_db)):
     }
 
 @router.delete("/{account_id}")
-async def delete_bank_account(account_id: int, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(BankAccount).where(BankAccount.id == account_id))
+async def delete_bank_account(
+    account_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(BankAccount).where(
+            BankAccount.id == account_id,
+            BankAccount.tenant_id == current_user.tenant_id,
+        )
+    )
     account = result.scalar_one_or_none()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
