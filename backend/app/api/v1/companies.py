@@ -1,6 +1,7 @@
 """Companies an owner can open, the sites inside each one, and who may manage them."""
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,6 +12,9 @@ from app.api.v1.auth import _hash_password
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
 from app.core.tenant_access import bind_tenant
+from app.models.account_profile import AccountProfile
+from app.models.bank_account import BankAccount
+from app.models.bank_account_site import BankAccountSite
 from app.models.company_membership import CompanyMembership
 from app.models.local_auth_user import LocalAuthUser
 from app.models.site import Site
@@ -19,6 +23,7 @@ from app.models_orm import Tenant, TenantTier
 router = APIRouter()
 
 SITE_KINDS = {"restaurant", "bar", "chiringuito", "apartments"}
+MONEY_SOURCES = {"cards", "cash", "booking", "stripe"}
 MIN_PASSWORD_LENGTH = 10
 
 
@@ -119,6 +124,189 @@ async def add_company(
         data.get("timezone") or "Europe/Madrid",
         data.get("currency") or "EUR",
     )
+
+
+def _sources(raw) -> list[str]:
+    if isinstance(raw, list):
+        values = raw
+    else:
+        try:
+            values = json.loads(raw or "[]")
+        except json.JSONDecodeError:
+            values = []
+    cleaned = []
+    for value in values:
+        key = str(value).strip().lower()
+        if key in MONEY_SOURCES and key not in cleaned:
+            cleaned.append(key)
+    return cleaned
+
+
+def _validate_guided_setup(data: dict) -> list[dict]:
+    companies = data.get("companies")
+    if not isinstance(companies, list) or not companies:
+        raise HTTPException(status_code=422, detail="Add at least one company")
+    seen_places: set[str] = set()
+    cleaned = []
+    for company in companies:
+        name = (company.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Every company needs a name")
+        places = []
+        for place in company.get("places") or []:
+            place_name = (place.get("name") or "").strip()
+            kind = (place.get("kind") or "").strip().lower()
+            if not place_name:
+                raise HTTPException(status_code=422, detail="Every place needs a name")
+            if kind not in SITE_KINDS:
+                raise HTTPException(status_code=422, detail="Each place is a restaurant, bar, chiringuito, or apartments")
+            key = place_name.lower()
+            if key in seen_places:
+                raise HTTPException(status_code=422, detail=f"Place names must be unique: {place_name}")
+            seen_places.add(key)
+            places.append({"name": place_name[:255], "kind": kind})
+        if not places:
+            raise HTTPException(status_code=422, detail=f"{name} needs at least one place")
+        place_names = {place["name"] for place in places}
+        accounts = []
+        covered: set[str] = set()
+        for account in company.get("accounts") or []:
+            linked = []
+            for place_name in account.get("place_names") or []:
+                label = str(place_name).strip()
+                if label not in place_names:
+                    raise HTTPException(status_code=422, detail=f"{label} is not a place of {name}")
+                if label in covered:
+                    raise HTTPException(status_code=422, detail=f"{label} is already on another account")
+                covered.add(label)
+                linked.append(label)
+            if not linked:
+                raise HTTPException(status_code=422, detail="Every account needs at least one place")
+            pending = bool(account.get("pending"))
+            bank_name = (account.get("bank_name") or "").strip()
+            iban = (account.get("iban") or "").strip()
+            sources = _sources(account.get("sources"))
+            if not pending and (not bank_name or not iban):
+                raise HTTPException(status_code=422, detail="Each account needs a bank and an IBAN, or mark it as not yet")
+            if not pending and not sources:
+                raise HTTPException(status_code=422, detail="Say what money arrives in each account")
+            accounts.append({
+                "bank_name": bank_name[:100],
+                "iban": iban[:100],
+                "currency": ((account.get("currency") or "EUR").strip() or "EUR")[:3],
+                "sources": sources,
+                "pending": pending,
+                "place_names": linked,
+            })
+        missing = place_names - covered
+        if missing:
+            raise HTTPException(status_code=422, detail=f"These places still need an account: {', '.join(sorted(missing))}")
+        cleaned.append({"name": name[:255], "places": places, "accounts": accounts})
+    return cleaned
+
+
+async def _save_holding_name(db: AsyncSession, tenant_id: uuid.UUID, holding_name: str) -> None:
+    found = await db.execute(select(AccountProfile).where(AccountProfile.tenant_id == tenant_id))
+    profile = found.scalar_one_or_none()
+    payload = {}
+    if profile is not None and profile.payload:
+        try:
+            payload = json.loads(profile.payload)
+        except json.JSONDecodeError:
+            payload = {}
+    payload["holding_name"] = holding_name
+    payload["guided_setup"] = True
+    encoded = json.dumps(payload)
+    if profile is None:
+        db.add(AccountProfile(tenant_id=tenant_id, payload=encoded, onboarding_complete=1))
+    else:
+        profile.payload = encoded
+        profile.onboarding_complete = 1
+
+
+@router.post("/guided-setup", status_code=status.HTTP_201_CREATED)
+async def apply_guided_setup(
+    data: dict,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Save the companies, places, and bank accounts from the short setup."""
+    if "owner" not in current_user.company_roles.values():
+        raise HTTPException(status_code=403, detail="Only an owner can set up the group")
+    companies = _validate_guided_setup(data)
+    holding_name = (data.get("holding_name") or "").strip()[:255]
+    home = await db.get(Tenant, current_user.tenant_id)
+    if home is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    require_owner(current_user, current_user.tenant_id)
+
+    created_ids: list[uuid.UUID] = []
+    for index, company in enumerate(companies):
+        if index == 0:
+            home.name = company["name"]
+            created_ids.append(home.id)
+            continue
+        tenant_id = uuid.uuid4()
+        db.add(Tenant(
+            id=tenant_id,
+            name=company["name"],
+            slug=f"co-{tenant_id.hex[:16]}",
+            timezone="Europe/Madrid",
+            currency="EUR",
+            is_active=True,
+            subscription_plan="free",
+            tier=TenantTier.STARTER,
+        ))
+        db.add(CompanyMembership(user_id=current_user.id, tenant_id=tenant_id, role="owner"))
+        created_ids.append(tenant_id)
+    await db.flush()
+
+    picture = []
+    for tenant_id, company in zip(created_ids, companies):
+        sites_by_name = {}
+        site_rows = []
+        for place in company["places"]:
+            site = Site(id=uuid.uuid4(), tenant_id=tenant_id, name=place["name"], kind=place["kind"])
+            db.add(site)
+            sites_by_name[place["name"]] = site
+            site_rows.append(site)
+        await db.flush()
+        account_rows = []
+        for account in company["accounts"]:
+            label = account["bank_name"] or "Pendiente"
+            row = BankAccount(
+                tenant_id=tenant_id,
+                name=label[:100],
+                bank_name=account["bank_name"] or None,
+                iban=account["iban"] or None,
+                currency=account["currency"],
+                sources=json.dumps(account["sources"]),
+                pending=1 if account["pending"] else 0,
+                is_active=1,
+            )
+            db.add(row)
+            await db.flush()
+            for place_name in account["place_names"]:
+                db.add(BankAccountSite(bank_account_id=row.id, site_id=sites_by_name[place_name].id))
+            account_rows.append({
+                "id": row.id,
+                "bank_name": row.bank_name or "",
+                "iban": row.iban or "",
+                "currency": row.currency,
+                "pending": bool(row.pending),
+                "sources": account["sources"],
+                "place_names": account["place_names"],
+            })
+        picture.append({
+            "id": str(tenant_id),
+            "name": company["name"],
+            "sites": [_site_out(site) for site in site_rows],
+            "accounts": account_rows,
+        })
+
+    await _save_holding_name(db, home.id, holding_name)
+    await db.commit()
+    return {"holding_name": holding_name, "companies": picture}
 
 
 @router.get("/{tenant_id}/sites")

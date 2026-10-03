@@ -1,5 +1,5 @@
 from app.core.uuid_type import UUID
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text
 from sqlalchemy.sql import func
 from app.core.database import Base
 
@@ -12,6 +12,8 @@ class BankAccount(Base):
     account_number = Column(String(100), nullable=True)
     iban = Column(String(100), nullable=True)
     currency = Column(String(10), default="EUR")
+    sources = Column(Text, nullable=True)
+    pending = Column(Integer, default=0)
     opening_balance = Column(Float, nullable=True)
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, server_default=func.now())
