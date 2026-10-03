@@ -9,10 +9,12 @@ from .auth import CurrentUser
 
 
 def bind_tenant(current_user: CurrentUser, requested: uuid.UUID | None = None) -> uuid.UUID:
-    """Return the caller's tenant. A different requested id is a cross-account access."""
-    if requested is not None and requested != current_user.tenant_id:
+    """Return a company this person is allowed to open. Anything else is denied."""
+    target = requested if requested is not None else current_user.tenant_id
+    allowed = getattr(current_user, "company_roles", None) or {current_user.tenant_id: "owner"}
+    if target not in allowed:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Tenant access denied",
         )
-    return current_user.tenant_id
+    return target

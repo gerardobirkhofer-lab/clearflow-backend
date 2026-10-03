@@ -20,11 +20,19 @@ ALGORITHM = "HS256"
 
 
 class CurrentUser:
-    def __init__(self, id, email: str, tenant_id: uuid.UUID, role: str = "OWNER"):
+    def __init__(
+        self,
+        id,
+        email: str,
+        tenant_id: uuid.UUID,
+        role: str = "OWNER",
+        company_roles: dict[uuid.UUID, str] | None = None,
+    ):
         self.id = id
         self.email = email
         self.tenant_id = tenant_id
         self.role = role
+        self.company_roles = company_roles if company_roles is not None else {tenant_id: "owner"}
 
 
 def _unauthorized() -> None:
@@ -59,6 +67,7 @@ async def get_current_user(
         _unauthorized()
 
     from app.core.database import SharedSessionLocal
+    from app.models.company_membership import CompanyMembership
     from app.models.local_auth_user import LocalAuthUser
 
     async with SharedSessionLocal() as session:
@@ -66,6 +75,12 @@ async def get_current_user(
             select(LocalAuthUser).where(LocalAuthUser.id == user_id_int)
         )
         user = result.scalar_one_or_none()
+        memberships = []
+        if user is not None:
+            membership_rows = await session.execute(
+                select(CompanyMembership).where(CompanyMembership.user_id == user.id)
+            )
+            memberships = membership_rows.scalars().all()
 
     if user is None or user.tenant_id is None:
         _unauthorized()
@@ -74,11 +89,24 @@ async def get_current_user(
     if not isinstance(tenant_id, uuid.UUID):
         tenant_id = uuid.UUID(str(tenant_id))
 
+    company_roles: dict[uuid.UUID, str] = {}
+    for membership in memberships:
+        member_tenant = membership.tenant_id
+        if not isinstance(member_tenant, uuid.UUID):
+            member_tenant = uuid.UUID(str(member_tenant))
+        company_roles[member_tenant] = (membership.role or "manager").lower()
+    if tenant_id not in company_roles:
+        company_roles[tenant_id] = "owner"
+        async with SharedSessionLocal() as session:
+            session.add(CompanyMembership(user_id=user.id, tenant_id=tenant_id, role="owner"))
+            await session.commit()
+
     return CurrentUser(
         id=user.id,
         email=user.email,
         tenant_id=tenant_id,
         role=user.role.upper() if user.role else "OWNER",
+        company_roles=company_roles,
     )
 
 

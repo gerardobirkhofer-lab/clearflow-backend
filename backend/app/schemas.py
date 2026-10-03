@@ -210,6 +210,13 @@ class TenantUpgradeRequest(BaseModel):
     database_name: str | None = None
 
 
+class SiteResponse(BaseModel):
+    id: UUID
+    name: str
+    kind: str
+    model_config = ConfigDict(from_attributes=True)
+
+
 class TenantResponse(BaseModel):
     id: UUID
     name: str
@@ -222,6 +229,8 @@ class TenantResponse(BaseModel):
     tier: TenantTier
     created_at: datetime
     updated_at: datetime
+    role: str | None = None
+    sites: list[SiteResponse] = []
     model_config = ConfigDict(from_attributes=True)
 
 

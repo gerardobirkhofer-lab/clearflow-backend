@@ -13,6 +13,7 @@ from ...core.database import get_db, get_shared_db
 from ...core.auth import get_current_user, CurrentUser
 from ...core.tenant import get_current_tenant
 from ...core.tenant_access import bind_tenant
+from .companies import companies_for_user, create_company, require_owner
 from ...models_orm import Tenant
 from ...schemas import (
     TenantCreate,
@@ -43,18 +44,8 @@ async def create_tenant(
     db: AsyncSession = Depends(get_shared_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """Each account already has one tenant. Rename that tenant instead of creating another."""
-    tenant = await db.get(Tenant, current_user.tenant_id)
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant not found")
-    tenant.name = data.name
-    if data.timezone:
-        tenant.timezone = data.timezone
-    if data.currency:
-        tenant.currency = data.currency
-    await db.commit()
-    await db.refresh(tenant)
-    return tenant
+    """Add another company for this owner. The account's first company stays in place."""
+    return await create_company(db, current_user, data.name, data.timezone, data.currency)
 
 
 @router.get("/", response_model=TenantListResponse)
@@ -62,10 +53,8 @@ async def list_tenants(
     db: AsyncSession = Depends(get_shared_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """Return only the tenant that belongs to the signed-in account."""
-    tenant = await db.get(Tenant, current_user.tenant_id)
-    items = [tenant] if tenant is not None else []
-    return TenantListResponse(items=items)
+    """Return every company this person is allowed to open."""
+    return await companies_for_user(db, current_user)
 
 
 @router.put("/upgrade", response_model=TenantResponse)
@@ -77,6 +66,7 @@ async def upgrade_tenant(
 ):
     """Change the plan on the caller's own tenant. Dedicated database URLs are not client input."""
     tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -95,8 +85,9 @@ async def update_tenant(
     db: AsyncSession = Depends(get_shared_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """Update the caller's own tenant name, timezone, or currency."""
+    """Update a company this person owns."""
     tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")

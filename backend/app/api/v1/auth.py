@@ -15,6 +15,7 @@ import jwt
 from sqlalchemy import select
 
 from app.core.database import SharedSessionLocal
+from app.models.company_membership import CompanyMembership
 from app.models.local_auth_user import LocalAuthUser
 
 router = APIRouter()
@@ -71,6 +72,18 @@ def _as_uuid(value) -> uuid.UUID | None:
     if isinstance(value, uuid.UUID):
         return value
     return uuid.UUID(str(value))
+
+
+async def _ensure_owner_membership(session, user_id: int, tenant_id: uuid.UUID) -> None:
+    """Give this account owner access to its own company, once."""
+    existing = await session.execute(
+        select(CompanyMembership).where(
+            CompanyMembership.user_id == user_id,
+            CompanyMembership.tenant_id == tenant_id,
+        )
+    )
+    if existing.scalar_one_or_none() is None:
+        session.add(CompanyMembership(user_id=user_id, tenant_id=tenant_id, role="owner"))
 
 
 async def _create_tenant_for_account(session, name: str, email: str) -> uuid.UUID:
@@ -136,6 +149,8 @@ async def register(data: dict, request: Request):
             tenant_id=tenant_id,
         )
         session.add(user)
+        await session.flush()
+        await _ensure_owner_membership(session, user.id, tenant_id)
         await session.commit()
         await session.refresh(user)
 
@@ -163,9 +178,11 @@ async def login(data: dict, request: Request):
         if tenant_id is None:
             tenant_id = await _create_tenant_for_account(session, user.name, user.email)
             user.tenant_id = tenant_id
-            await session.commit()
-            await session.refresh(user)
+            await session.flush()
             tenant_id = _as_uuid(user.tenant_id)
+        await _ensure_owner_membership(session, user.id, tenant_id)
+        await session.commit()
+        await session.refresh(user)
 
     token = _create_access_token(user.id, user.email, tenant_id)
     return {"token": token, "user": _user_out(user)}
