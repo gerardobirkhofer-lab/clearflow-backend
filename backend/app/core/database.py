@@ -54,7 +54,7 @@ SharedSessionLocal = async_sessionmaker(
 Base = declarative_base()
 
 # Import legacy models so they register in Base.metadata
-from app.models import account_profile, bank_account, bank_account_site, bank_transaction, company_membership, dispute, dispute_email_log, expected_collection, local_auth_user, provider, provider_connection, provider_transaction, site, user
+from app.models import account_profile, auth_attempt, bank_account, bank_account_site, bank_transaction, company_membership, dispute, dispute_email_log, expected_collection, local_auth_user, provider, provider_connection, provider_transaction, security_event, site, user
 
 
 # ── Tenant-aware DB Manager ───────────────────────────────────────────────────
@@ -202,6 +202,8 @@ async def init_db() -> None:
             ))
             await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS sources TEXT"))
             await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS pending INTEGER DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN iban TYPE TEXT"))
+            await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN account_number TYPE TEXT"))
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)

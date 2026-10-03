@@ -51,3 +51,11 @@ def decrypt_secret(value: str | None) -> str:
         return _fernet().decrypt(token).decode("utf-8")
     except InvalidToken as exc:
         raise ValueError("Stored credential could not be decrypted") from exc
+
+
+def mask_secret(value: str | None) -> str:
+    """Show only the last four characters of an account number."""
+    if not value:
+        return ""
+    visible = value[-4:]
+    return f"••••{visible}"

@@ -78,6 +78,8 @@ def test_guided_setup_links_shared_and_separate_accounts():
         shared = body["companies"][0]["accounts"][0]
         assert shared["place_names"] == ["Restaurante Centro", "Restaurante Norte"]
         assert shared["sources"] == ["cards"]
+        assert shared["iban"] == "••••S111"
+        assert "ES111" not in shared["iban"]
         assert body["companies"][1]["accounts"][0]["pending"] is True
 
         listed = client.get("/api/v1/companies", headers=headers)

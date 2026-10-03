@@ -5,16 +5,16 @@ and copied into the JWT. Request handlers still load the tenant from the databas
 from __future__ import annotations
 
 import os
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 import bcrypt
 import jwt
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from app.core.database import SharedSessionLocal
+from app.models.auth_attempt import AuthAttempt
 from app.models.company_membership import CompanyMembership
 from app.models.local_auth_user import LocalAuthUser
 
@@ -24,7 +24,6 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clearflow-secret-key-change-in-product
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 MIN_PASSWORD_LENGTH = 10
-_ATTEMPTS: dict[str, list[float]] = {}
 
 
 def _client_key(request: Request, email: str) -> str:
@@ -33,13 +32,28 @@ def _client_key(request: Request, email: str) -> str:
     return f"{host}:{email}"
 
 
-def _rate_limit(key: str, limit: int, window_seconds: int) -> None:
-    now = time.monotonic()
-    recent = [stamp for stamp in _ATTEMPTS.get(key, []) if now - stamp < window_seconds]
-    if len(recent) >= limit:
-        raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
-    recent.append(now)
-    _ATTEMPTS[key] = recent
+async def _rate_limit(key: str, limit: int, window_seconds: int) -> None:
+    """Count attempts in the database so a new process still remembers them."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+    stored_key = key[:255]
+    async with SharedSessionLocal() as session:
+        await session.execute(
+            delete(AuthAttempt).where(
+                AuthAttempt.attempt_key == stored_key,
+                AuthAttempt.created_at < cutoff,
+            )
+        )
+        count = await session.scalar(
+            select(func.count()).select_from(AuthAttempt).where(
+                AuthAttempt.attempt_key == stored_key,
+                AuthAttempt.created_at >= cutoff,
+            )
+        )
+        if (count or 0) >= limit:
+            await session.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
+        session.add(AuthAttempt(attempt_key=stored_key))
+        await session.commit()
 
 
 def _hash_password(password: str) -> str:
@@ -132,7 +146,7 @@ async def register(data: dict, request: Request):
             status_code=422,
             detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
         )
-    _rate_limit(f"register:{_client_key(request, email)}", limit=5, window_seconds=3600)
+    await _rate_limit(f"register:{_client_key(request, email)}", limit=5, window_seconds=3600)
 
     async with SharedSessionLocal() as session:
         existing = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
@@ -166,7 +180,7 @@ async def login(data: dict, request: Request):
 
     if not email or not password:
         raise HTTPException(status_code=422, detail="Email and password required")
-    _rate_limit(f"login:{_client_key(request, email)}", limit=8, window_seconds=300)
+    await _rate_limit(f"login:{_client_key(request, email)}", limit=8, window_seconds=300)
 
     async with SharedSessionLocal() as session:
         result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
@@ -206,7 +220,7 @@ async def forgot_password(data: dict, request: Request):
     email = (data.get("email") or "").strip().lower()
     if not email:
         raise HTTPException(status_code=422, detail="Email required")
-    _rate_limit(f"forgot:{_client_key(request, email)}", limit=5, window_seconds=3600)
+    await _rate_limit(f"forgot:{_client_key(request, email)}", limit=5, window_seconds=3600)
 
     async with SharedSessionLocal() as session:
         result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
@@ -235,7 +249,7 @@ async def reset_password(data: dict, request: Request):
             status_code=422,
             detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
         )
-    _rate_limit(f"reset:{_client_key(request, 'token')}", limit=10, window_seconds=3600)
+    await _rate_limit(f"reset:{_client_key(request, 'token')}", limit=10, window_seconds=3600)
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
     except Exception:

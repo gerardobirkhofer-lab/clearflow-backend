@@ -5,18 +5,21 @@ import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.auth import _hash_password
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
+from app.core.secrets import decrypt_secret, encrypt_secret, mask_secret
 from app.core.tenant_access import bind_tenant
 from app.models.account_profile import AccountProfile
 from app.models.bank_account import BankAccount
 from app.models.bank_account_site import BankAccountSite
+from app.models.bank_transaction import BankTransaction
 from app.models.company_membership import CompanyMembership
 from app.models.local_auth_user import LocalAuthUser
+from app.models.security_event import SecurityEvent
 from app.models.site import Site
 from app.models_orm import Tenant, TenantTier
 
@@ -184,7 +187,9 @@ def _validate_guided_setup(data: dict) -> list[dict]:
                 raise HTTPException(status_code=422, detail="Every account needs at least one place")
             pending = bool(account.get("pending"))
             bank_name = (account.get("bank_name") or "").strip()
-            iban = (account.get("iban") or "").strip()
+            iban = (account.get("iban") or "").strip().replace(" ", "")
+            if len(iban) > 42:
+                raise HTTPException(status_code=422, detail="IBAN is too long")
             sources = _sources(account.get("sources"))
             if not pending and (not bank_name or not iban):
                 raise HTTPException(status_code=422, detail="Each account needs a bank and an IBAN, or mark it as not yet")
@@ -192,7 +197,7 @@ def _validate_guided_setup(data: dict) -> list[dict]:
                 raise HTTPException(status_code=422, detail="Say what money arrives in each account")
             accounts.append({
                 "bank_name": bank_name[:100],
-                "iban": iban[:100],
+                "iban": iban,
                 "currency": ((account.get("currency") or "EUR").strip() or "EUR")[:3],
                 "sources": sources,
                 "pending": pending,
@@ -274,11 +279,12 @@ async def apply_guided_setup(
         account_rows = []
         for account in company["accounts"]:
             label = account["bank_name"] or "Pendiente"
+            plain_iban = account["iban"]
             row = BankAccount(
                 tenant_id=tenant_id,
                 name=label[:100],
                 bank_name=account["bank_name"] or None,
-                iban=account["iban"] or None,
+                iban=encrypt_secret(plain_iban) if plain_iban else None,
                 currency=account["currency"],
                 sources=json.dumps(account["sources"]),
                 pending=1 if account["pending"] else 0,
@@ -288,10 +294,14 @@ async def apply_guided_setup(
             await db.flush()
             for place_name in account["place_names"]:
                 db.add(BankAccountSite(bank_account_id=row.id, site_id=sites_by_name[place_name].id))
+            _remember(db, current_user, tenant_id, "bank_account.saved", row.id, {
+                "bank_name": row.bank_name or "",
+                "iban": mask_secret(plain_iban),
+            })
             account_rows.append({
                 "id": row.id,
                 "bank_name": row.bank_name or "",
-                "iban": row.iban or "",
+                "iban": mask_secret(plain_iban),
                 "currency": row.currency,
                 "pending": bool(row.pending),
                 "sources": account["sources"],
@@ -307,6 +317,178 @@ async def apply_guided_setup(
     await _save_holding_name(db, home.id, holding_name)
     await db.commit()
     return {"holding_name": holding_name, "companies": picture}
+
+
+def _remember(db: AsyncSession, current_user: CurrentUser, tenant_id: uuid.UUID, action: str, target_id, detail: dict) -> None:
+    db.add(SecurityEvent(
+        tenant_id=tenant_id,
+        user_id=current_user.id,
+        action=action,
+        target_type="bank_account",
+        target_id=str(target_id) if target_id is not None else None,
+        detail=json.dumps(detail),
+    ))
+
+
+def _public_iban(stored: str | None) -> str:
+    if not stored:
+        return ""
+    try:
+        return mask_secret(decrypt_secret(stored))
+    except ValueError:
+        return "••••"
+
+
+async def _bank_accounts_for(db: AsyncSession, tenant_id: uuid.UUID) -> list[dict]:
+    rows = await db.execute(
+        select(BankAccount).where(BankAccount.tenant_id == tenant_id, BankAccount.is_active == 1).order_by(BankAccount.id)
+    )
+    accounts = list(rows.scalars().all())
+    if not accounts:
+        return []
+    ids = [account.id for account in accounts]
+    link_rows = await db.execute(select(BankAccountSite).where(BankAccountSite.bank_account_id.in_(ids)))
+    links = list(link_rows.scalars().all())
+    site_ids = [link.site_id for link in links]
+    names: dict = {}
+    if site_ids:
+        site_rows = await db.execute(select(Site).where(Site.id.in_(site_ids)))
+        names = {site.id: site.name for site in site_rows.scalars().all()}
+    grouped: dict[int, list[str]] = {}
+    for link in links:
+        grouped.setdefault(link.bank_account_id, []).append(names.get(link.site_id, ""))
+    return [
+        {
+            "id": account.id,
+            "bank_name": account.bank_name or account.name,
+            "iban": _public_iban(account.iban or account.account_number),
+            "currency": account.currency,
+            "pending": bool(account.pending),
+            "place_names": [name for name in grouped.get(account.id, []) if name],
+        }
+        for account in accounts
+    ]
+
+
+@router.get("/{tenant_id}/bank-accounts")
+async def list_bank_accounts(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
+    return {"items": await _bank_accounts_for(db, tenant_id)}
+
+
+@router.post("/{tenant_id}/bank-accounts", status_code=status.HTTP_201_CREATED)
+async def add_bank_account(
+    tenant_id: uuid.UUID,
+    data: dict,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Store one account number for this company. The full number is encrypted."""
+    tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
+    bank_name = (data.get("bank_name") or "").strip()
+    iban = (data.get("iban") or data.get("account_number") or "").strip().replace(" ", "")
+    if not bank_name or not iban:
+        raise HTTPException(status_code=422, detail="Bank name and IBAN are required")
+    if len(iban) > 42:
+        raise HTTPException(status_code=422, detail="IBAN is too long")
+    currency = ((data.get("currency") or "EUR").strip() or "EUR")[:3]
+    row = BankAccount(
+        tenant_id=tenant_id,
+        name=bank_name[:100],
+        bank_name=bank_name[:100],
+        iban=encrypt_secret(iban),
+        currency=currency,
+        pending=0,
+        is_active=1,
+    )
+    db.add(row)
+    await db.flush()
+    _remember(db, current_user, tenant_id, "bank_account.saved", row.id, {
+        "bank_name": bank_name[:100],
+        "iban": mask_secret(iban),
+    })
+    await db.commit()
+    return {
+        "id": row.id,
+        "bank_name": row.bank_name,
+        "iban": mask_secret(iban),
+        "currency": row.currency,
+        "pending": False,
+        "place_names": [],
+    }
+
+
+async def _delete_account(db: AsyncSession, tenant_id: uuid.UUID, account: BankAccount) -> int:
+    await db.execute(delete(BankAccountSite).where(BankAccountSite.bank_account_id == account.id))
+    movements = 0
+    if account.bank_name:
+        movement_filter = (
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.bank_name == account.bank_name,
+        )
+        movements = await db.scalar(select(func.count()).select_from(BankTransaction).where(*movement_filter))
+        await db.execute(delete(BankTransaction).where(*movement_filter))
+    await db.delete(account)
+    return int(movements or 0)
+
+
+@router.delete("/{tenant_id}/bank-accounts/{account_id}")
+async def remove_bank_account(
+    tenant_id: uuid.UUID,
+    account_id: int,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Remove one account number and the imported movements of that bank."""
+    tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
+    found = await db.execute(
+        select(BankAccount).where(BankAccount.id == account_id, BankAccount.tenant_id == tenant_id)
+    )
+    account = found.scalar_one_or_none()
+    if account is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    masked = _public_iban(account.iban or account.account_number)
+    bank_name = account.bank_name or ""
+    movements = await _delete_account(db, tenant_id, account)
+    _remember(db, current_user, tenant_id, "bank_account.deleted", account_id, {
+        "bank_name": bank_name,
+        "iban": masked,
+        "movements_deleted": movements,
+    })
+    await db.commit()
+    return {"deleted": True, "movements_deleted": movements}
+
+
+@router.delete("/{tenant_id}/bank-data")
+async def remove_company_bank_data(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Remove every stored account number and imported bank movement for this company."""
+    tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
+    found = await db.execute(select(BankAccount.id).where(BankAccount.tenant_id == tenant_id))
+    account_ids = [row[0] for row in found.all()]
+    if account_ids:
+        await db.execute(delete(BankAccountSite).where(BankAccountSite.bank_account_id.in_(account_ids)))
+        await db.execute(delete(BankAccount).where(BankAccount.tenant_id == tenant_id))
+    movements = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
+    )
+    await db.execute(delete(BankTransaction).where(BankTransaction.tenant_id == tenant_id))
+    _remember(db, current_user, tenant_id, "bank_data.deleted", None, {
+        "accounts_deleted": len(account_ids),
+        "movements_deleted": int(movements or 0),
+    })
+    await db.commit()
+    return {"deleted": True, "accounts_deleted": len(account_ids), "movements_deleted": int(movements or 0)}
 
 
 @router.get("/{tenant_id}/sites")

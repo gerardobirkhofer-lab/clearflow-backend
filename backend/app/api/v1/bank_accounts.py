@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.secrets import decrypt_secret, encrypt_secret, mask_secret
 from app.models.bank_account import BankAccount
 
 router = APIRouter()
@@ -14,12 +15,14 @@ async def create_bank_account(
     db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    plain_iban = (data.get("iban") or "").strip()
+    plain_number = (data.get("account_number") or "").strip()
     account = BankAccount(
         tenant_id=current_user.tenant_id,
         name=data.get("name"),
         bank_name=data.get("bank_name"),
-        account_number=data.get("account_number"),
-        iban=data.get("iban"),
+        account_number=encrypt_secret(plain_number) if plain_number else None,
+        iban=encrypt_secret(plain_iban) if plain_iban else None,
         currency=data.get("currency", "EUR"),
         opening_balance=data.get("opening_balance"),
         is_active=1,
@@ -31,8 +34,8 @@ async def create_bank_account(
         "id": account.id,
         "name": account.name,
         "bank_name": account.bank_name,
-        "account_number": account.account_number,
-        "iban": account.iban,
+        "account_number": mask_secret(decrypt_secret(account.account_number)),
+        "iban": mask_secret(decrypt_secret(account.iban)),
         "currency": account.currency,
         "opening_balance": account.opening_balance,
     }
@@ -54,8 +57,8 @@ async def list_bank_accounts(
                 "id": a.id,
                 "name": a.name,
                 "bank_name": a.bank_name,
-                "account_number": a.account_number,
-                "iban": a.iban,
+                "account_number": mask_secret(decrypt_secret(a.account_number)),
+                "iban": mask_secret(decrypt_secret(a.iban)),
                 "currency": a.currency,
                 "opening_balance": a.opening_balance,
             }
