@@ -54,7 +54,7 @@ SharedSessionLocal = async_sessionmaker(
 Base = declarative_base()
 
 # Import legacy models so they register in Base.metadata
-from app.models import bank_account, bank_transaction, dispute, dispute_email_log, expected_collection, provider, provider_connection, provider_transaction, user, local_auth_user
+from app.models import account_profile, auth_attempt, bank_account, bank_account_site, bank_transaction, company_membership, dispute, dispute_email_log, expected_collection, local_auth_user, provider, provider_connection, provider_transaction, security_event, site, user
 
 
 # ── Tenant-aware DB Manager ───────────────────────────────────────────────────
@@ -160,6 +160,24 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+async def _encrypt_plain_account_numbers() -> None:
+    """Encrypt account numbers saved before encryption was turned on."""
+    from app.core.secrets import encrypt_secret
+    from app.models.bank_account import BankAccount
+
+    async with SharedSessionLocal() as session:
+        rows = await session.execute(select(BankAccount))
+        changed = False
+        for account in rows.scalars().all():
+            for field in ("iban", "account_number"):
+                value = getattr(account, field)
+                if value and not str(value).startswith("enc:v1:"):
+                    setattr(account, field, encrypt_secret(value))
+                    changed = True
+        if changed:
+            await session.commit()
+
+
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
     Combines legacy and new ORM tables, skipping duplicates.
@@ -200,10 +218,16 @@ async def init_db() -> None:
                 $$;
                 """
             ))
+            await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS sources TEXT"))
+            await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS pending INTEGER DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN iban TYPE TEXT"))
+            await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN account_number TYPE TEXT"))
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
         logger.warning(f"DB init warning (tables likely exist): {e}")
+
+    await _encrypt_plain_account_numbers()
 
     # Ensure default tenant exists (required for demo user)
     async with SharedSessionLocal() as session:

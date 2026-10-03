@@ -1,3 +1,4 @@
+from .account_profile import AccountProfile
 from .local_auth_user import LocalAuthUser
 from .bank_account import BankAccount
 from .bank_transaction import BankTransaction

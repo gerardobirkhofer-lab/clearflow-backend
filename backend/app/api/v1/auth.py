@@ -11,9 +11,11 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, HTTPException, Request
 import bcrypt
 import jwt
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from app.core.database import SharedSessionLocal
+from app.models.auth_attempt import AuthAttempt
+from app.models.company_membership import CompanyMembership
 from app.models.local_auth_user import LocalAuthUser
 
 router = APIRouter()
@@ -21,6 +23,37 @@ router = APIRouter()
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "clearflow-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
+MIN_PASSWORD_LENGTH = 10
+
+
+def _client_key(request: Request, email: str) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    host = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else "unknown")
+    return f"{host}:{email}"
+
+
+async def _rate_limit(key: str, limit: int, window_seconds: int) -> None:
+    """Count attempts in the database so a new process still remembers them."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+    stored_key = key[:255]
+    async with SharedSessionLocal() as session:
+        await session.execute(
+            delete(AuthAttempt).where(
+                AuthAttempt.attempt_key == stored_key,
+                AuthAttempt.created_at < cutoff,
+            )
+        )
+        count = await session.scalar(
+            select(func.count()).select_from(AuthAttempt).where(
+                AuthAttempt.attempt_key == stored_key,
+                AuthAttempt.created_at >= cutoff,
+            )
+        )
+        if (count or 0) >= limit:
+            await session.commit()
+            raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
+        session.add(AuthAttempt(attempt_key=stored_key))
+        await session.commit()
 
 
 def _hash_password(password: str) -> str:
@@ -53,6 +86,18 @@ def _as_uuid(value) -> uuid.UUID | None:
     if isinstance(value, uuid.UUID):
         return value
     return uuid.UUID(str(value))
+
+
+async def _ensure_owner_membership(session, user_id: int, tenant_id: uuid.UUID) -> None:
+    """Give this account owner access to its own company, once."""
+    existing = await session.execute(
+        select(CompanyMembership).where(
+            CompanyMembership.user_id == user_id,
+            CompanyMembership.tenant_id == tenant_id,
+        )
+    )
+    if existing.scalar_one_or_none() is None:
+        session.add(CompanyMembership(user_id=user_id, tenant_id=tenant_id, role="owner"))
 
 
 async def _create_tenant_for_account(session, name: str, email: str) -> uuid.UUID:
@@ -96,8 +141,12 @@ async def register(data: dict, request: Request):
 
     if not email or "@" not in email:
         raise HTTPException(status_code=422, detail="Valid email required")
-    if len(password) < 6:
-        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+    await _rate_limit(f"register:{_client_key(request, email)}", limit=5, window_seconds=3600)
 
     async with SharedSessionLocal() as session:
         existing = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
@@ -114,6 +163,8 @@ async def register(data: dict, request: Request):
             tenant_id=tenant_id,
         )
         session.add(user)
+        await session.flush()
+        await _ensure_owner_membership(session, user.id, tenant_id)
         await session.commit()
         await session.refresh(user)
 
@@ -122,13 +173,14 @@ async def register(data: dict, request: Request):
 
 
 @router.post("/login")
-async def login(data: dict):
+async def login(data: dict, request: Request):
     """Authenticate and ensure the account has its own tenant stored and signed."""
     email = (data.get("email") or "").strip().lower()
     password = data.get("password") or ""
 
     if not email or not password:
         raise HTTPException(status_code=422, detail="Email and password required")
+    await _rate_limit(f"login:{_client_key(request, email)}", limit=8, window_seconds=300)
 
     async with SharedSessionLocal() as session:
         result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
@@ -140,9 +192,80 @@ async def login(data: dict):
         if tenant_id is None:
             tenant_id = await _create_tenant_for_account(session, user.name, user.email)
             user.tenant_id = tenant_id
-            await session.commit()
-            await session.refresh(user)
+            await session.flush()
             tenant_id = _as_uuid(user.tenant_id)
+        await _ensure_owner_membership(session, user.id, tenant_id)
+        await session.commit()
+        await session.refresh(user)
 
     token = _create_access_token(user.id, user.email, tenant_id)
     return {"token": token, "user": _user_out(user)}
+
+
+def _reset_token(user_id: int, email: str) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "purpose": "password_reset",
+        "iat": now,
+        "exp": now + timedelta(minutes=30),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+@router.post("/forgot-password")
+async def forgot_password(data: dict, request: Request):
+    """Always return the same response so callers cannot learn which emails exist."""
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=422, detail="Email required")
+    await _rate_limit(f"forgot:{_client_key(request, email)}", limit=5, window_seconds=3600)
+
+    async with SharedSessionLocal() as session:
+        result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
+        user = result.scalar_one_or_none()
+
+    if user is not None:
+        token = _reset_token(user.id, user.email)
+        from app.core.email import get_email_service
+
+        frontend = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        link = f"{frontend}/login?reset={token}"
+        await get_email_service().send_email(
+            to=user.email,
+            subject="Reset your ClearFlow password",
+            body_text=f"Reset your password: {link}\nThis link expires in 30 minutes.",
+        )
+    return {"detail": "If that email is registered, a reset link is on its way."}
+
+
+@router.post("/reset-password")
+async def reset_password(data: dict, request: Request):
+    token = data.get("token") or ""
+    password = data.get("password") or ""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+    await _rate_limit(f"reset:{_client_key(request, 'token')}", limit=10, window_seconds=3600)
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+    if payload.get("purpose") != "password_reset":
+        raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+
+    async with SharedSessionLocal() as session:
+        result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.id == user_id))
+        user = result.scalar_one_or_none()
+        if user is None or user.email != payload.get("email"):
+            raise HTTPException(status_code=400, detail="Reset link is invalid or expired")
+        user.password_hash = _hash_password(password)
+        await session.commit()
+    return {"detail": "Password updated"}

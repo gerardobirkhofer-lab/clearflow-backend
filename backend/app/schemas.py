@@ -198,7 +198,7 @@ class TenantTier(str, PyEnum):
 
 class TenantCreate(BaseModel):
     name: str
-    slug: str
+    slug: str | None = None
     timezone: str = "Europe/Madrid"
     currency: str = "EUR"
     tier: TenantTier = TenantTier.STARTER
@@ -208,6 +208,13 @@ class TenantUpgradeRequest(BaseModel):
     tier: TenantTier
     database_url: str | None = None  # Required for Pro/Enterprise
     database_name: str | None = None
+
+
+class SiteResponse(BaseModel):
+    id: UUID
+    name: str
+    kind: str
+    model_config = ConfigDict(from_attributes=True)
 
 
 class TenantResponse(BaseModel):
@@ -220,10 +227,10 @@ class TenantResponse(BaseModel):
     subscription_plan: str
     subscription_expires_at: datetime | None = None
     tier: TenantTier
-    database_url: str | None = None
-    database_name: str | None = None
     created_at: datetime
     updated_at: datetime
+    role: str | None = None
+    sites: list[SiteResponse] = []
     model_config = ConfigDict(from_attributes=True)
 
 
