@@ -160,6 +160,24 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+async def _encrypt_plain_account_numbers() -> None:
+    """Encrypt account numbers saved before encryption was turned on."""
+    from app.core.secrets import encrypt_secret
+    from app.models.bank_account import BankAccount
+
+    async with SharedSessionLocal() as session:
+        rows = await session.execute(select(BankAccount))
+        changed = False
+        for account in rows.scalars().all():
+            for field in ("iban", "account_number"):
+                value = getattr(account, field)
+                if value and not str(value).startswith("enc:v1:"):
+                    setattr(account, field, encrypt_secret(value))
+                    changed = True
+        if changed:
+            await session.commit()
+
+
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
     Combines legacy and new ORM tables, skipping duplicates.
@@ -208,6 +226,8 @@ async def init_db() -> None:
         import logging
         logger = logging.getLogger(__name__)
         logger.warning(f"DB init warning (tables likely exist): {e}")
+
+    await _encrypt_plain_account_numbers()
 
     # Ensure default tenant exists (required for demo user)
     async with SharedSessionLocal() as session:
