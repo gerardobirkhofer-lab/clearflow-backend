@@ -241,6 +241,10 @@ async def init_db() -> None:
             await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS pending INTEGER DEFAULT 0"))
             await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN iban TYPE TEXT"))
             await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN account_number TYPE TEXT"))
+            await conn.execute(text("ALTER TABLE providers ADD COLUMN IF NOT EXISTS contract_filename VARCHAR(255)"))
+            await conn.execute(text("ALTER TABLE providers ADD COLUMN IF NOT EXISTS contract_body TEXT"))
+            await conn.execute(text("ALTER TABLE providers ADD COLUMN IF NOT EXISTS terms_confirmed INTEGER DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE providers ALTER COLUMN credit_delay_days DROP NOT NULL"))
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)

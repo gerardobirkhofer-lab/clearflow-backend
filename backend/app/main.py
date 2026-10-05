@@ -25,6 +25,7 @@ from .api.v1 import (
     account,
     auth,
     companies,
+    contracts,
     tenants,
     institutions,
     collections,
@@ -160,6 +161,7 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(account.router, prefix="/api/v1/account", tags=["account"])
     app.include_router(companies.router, prefix="/api/v1/companies", tags=["companies"])
+    app.include_router(contracts.router, prefix="/api/v1/companies", tags=["contracts"])
     app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])

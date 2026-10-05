@@ -1,4 +1,5 @@
 import uuid
+from datetime import date as date_cls
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, select, func
@@ -7,8 +8,10 @@ from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
 from app.core.tenant_access import bind_tenant
 from app.models.bank_transaction import BankTransaction
+from app.models.provider import Provider
 from app.models.provider_transaction import ProviderTransaction
 from app.models.reconciliation_day import ReconciliationDay
+from app.services.contract_terms import expected_arrival, expected_net
 from app.services.open_matching import match_open_items, record_day
 
 router = APIRouter()
@@ -28,8 +31,28 @@ def _money(value) -> float:
     return round(float(value or 0), 2)
 
 
+def _contract_view(contracts: dict, provider_name: str | None):
+    return contracts.get((provider_name or "").strip().lower())
+
+
+def _expectation(rule, amount, sale_on) -> dict | None:
+    if rule is None or not rule.terms_confirmed:
+        return None
+    arrival = expected_arrival(sale_on, rule.credit_delay_days, rule.batch_day_of_week)
+    return {
+        "expected_net": expected_net(amount, rule.fee_percent or 0, rule.fee_fixed or 0),
+        "expected_date": arrival.isoformat() if arrival else None,
+    }
+
+
 async def account_reconciliation(db: AsyncSession, tenant_id) -> dict:
     """Counts and rows actually stored for this tenant. No sample figures."""
+    contract_rows = (
+        await db.execute(
+            select(Provider).where(Provider.tenant_id == tenant_id, Provider.terms_confirmed == 1)
+        )
+    ).scalars().all()
+    contracts = {(row.name or "").strip().lower(): row for row in contract_rows}
     bank_agg = await db.execute(
         select(
             func.count(BankTransaction.id),
@@ -78,8 +101,10 @@ async def account_reconciliation(db: AsyncSession, tenant_id) -> dict:
         )
     ).all()
 
-    matched = [
-        {
+    matched = []
+    for prov, bank in pair_rows:
+        rule = _contract_view(contracts, prov.provider_name)
+        item = {
             "score": None,
             "bank": {
                 "id": bank.id,
@@ -95,8 +120,24 @@ async def account_reconciliation(db: AsyncSession, tenant_id) -> dict:
                 "date": _iso(prov.transaction_date),
             },
         }
-        for prov, bank in pair_rows
-    ]
+        expectation = _expectation(rule, prov.amount, prov.transaction_date)
+        if expectation and bank.amount is not None:
+            arrived = _money(bank.amount)
+            if abs(arrived - _money(prov.amount)) < 0.01:
+                fee_difference = 0.0
+            else:
+                fee_difference = round(expectation["expected_net"] - arrived, 2)
+            days_late = 0
+            if expectation["expected_date"] and bank.transaction_date is not None:
+                bank_day = bank.transaction_date.date()
+                expected_day = date_cls.fromisoformat(expectation["expected_date"])
+                days_late = max(0, (bank_day - expected_day).days)
+            item["settlement"] = {
+                **expectation,
+                "fee_difference": fee_difference,
+                "days_late": days_late,
+            }
+        matched.append(item)
     summary = {
         "total_bank": int(bank_count or 0),
         "total_provider": int(prov_count or 0),
@@ -130,6 +171,7 @@ async def account_reconciliation(db: AsyncSession, tenant_id) -> dict:
                 "concept": row.concept or "",
                 "amount": _money(row.amount),
                 "date": _iso(row.transaction_date),
+                **(_expectation(_contract_view(contracts, row.provider_name), row.amount, row.transaction_date) or {}),
             }
             for row in unmatched_prov_rows
         ],

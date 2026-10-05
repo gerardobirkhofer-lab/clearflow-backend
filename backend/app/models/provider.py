@@ -1,5 +1,5 @@
 from app.core.uuid_type import UUID
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Text
 from sqlalchemy.sql import func
 from app.core.database import Base
 
@@ -10,7 +10,7 @@ class Provider(Base):
     name = Column(String(100), nullable=False)
     provider_type = Column(String(50), nullable=False)
     settlement_mode = Column(String(50), default="per_transaction")
-    credit_delay_days = Column(Integer, default=2)
+    credit_delay_days = Column(Integer, nullable=True)
     debit_delay_days = Column(Integer, default=1)
     transfer_delay_days = Column(Integer, default=0)
     batch_day_of_week = Column(String(20), nullable=True)
@@ -21,5 +21,8 @@ class Provider(Base):
     monthly_fee = Column(Float, default=0.0)
     dispute_email = Column(String(255), nullable=True)
     contract_file_url = Column(String(500), nullable=True)
+    contract_filename = Column(String(255), nullable=True)
+    contract_body = Column(Text, nullable=True)
+    terms_confirmed = Column(Integer, default=0)
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, server_default=func.now())

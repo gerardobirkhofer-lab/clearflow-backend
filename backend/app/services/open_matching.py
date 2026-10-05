@@ -15,8 +15,10 @@ from sqlalchemy import case, func, select, text
 
 from app.core.database import SharedSessionLocal
 from app.models.bank_transaction import BankTransaction
+from app.models.provider import Provider
 from app.models.provider_transaction import ProviderTransaction
 from app.models.reconciliation_day import ReconciliationDay
+from app.services.contract_terms import expected_net
 
 MADRID = ZoneInfo("Europe/Madrid")
 
@@ -25,8 +27,25 @@ def madrid_today():
     return datetime.now(MADRID).date()
 
 
+def _contract_map(rows) -> dict:
+    return {(row.name or "").strip().lower(): row for row in rows if row.terms_confirmed}
+
+
+def _rule_for(contracts: dict, provider_name: str | None):
+    return contracts.get((provider_name or "").strip().lower())
+
+
 async def match_open_items(db, tenant_id) -> int:
     """Pair open provider lines with open bank lines. Leave finished pairs alone."""
+    contract_rows = (
+        await db.execute(
+            select(Provider).where(
+                Provider.tenant_id == tenant_id,
+                Provider.terms_confirmed == 1,
+            )
+        )
+    ).scalars().all()
+    contracts = _contract_map(contract_rows)
     prov_result = await db.execute(
         select(
             ProviderTransaction.id,
@@ -34,6 +53,7 @@ async def match_open_items(db, tenant_id) -> int:
             ProviderTransaction.transaction_date,
             ProviderTransaction.reference,
             ProviderTransaction.concept,
+            ProviderTransaction.provider_name,
         ).where(
             ProviderTransaction.tenant_id == tenant_id,
             ProviderTransaction.matched == 0,
@@ -41,10 +61,17 @@ async def match_open_items(db, tenant_id) -> int:
     )
     prov_by_amount = defaultdict(list)
     for row in prov_result.all():
-        bucket = round(float(row[1]), 0) if row[1] is not None else 0
-        prov_by_amount[bucket].append(row)
-        prov_by_amount[bucket + 1].append(row)
-        prov_by_amount[bucket - 1].append(row)
+        amounts = [float(row[1])] if row[1] is not None else [0]
+        rule = _rule_for(contracts, row[5])
+        if rule and ((rule.fee_percent or 0) or (rule.fee_fixed or 0)):
+            amounts.append(expected_net(row[1], rule.fee_percent or 0, rule.fee_fixed or 0))
+        seen = set()
+        for amount in amounts:
+            bucket = round(amount, 0)
+            for key in (bucket, bucket + 1, bucket - 1):
+                if key not in seen:
+                    prov_by_amount[key].append(row)
+                    seen.add(key)
 
     total_bank = await db.scalar(
         select(func.count()).where(
@@ -87,16 +114,26 @@ async def match_open_items(db, tenant_id) -> int:
                         candidates.append(row)
             best_match = None
             best_score = 0
-            for pid, p_amount, p_date, p_ref, p_conc in candidates:
+            for pid, p_amount, p_date, p_ref, p_conc, p_name in candidates:
                 score = 0
+                agreed_hit = False
                 if b_amount is not None and p_amount is not None:
-                    difference = abs(b_amount - p_amount)
-                    if difference < 0.01:
-                        score += 3
-                    elif difference < 1:
-                        score += 2
-                    elif difference < 5:
-                        score += 1
+                    rule = _rule_for(contracts, p_name)
+                    if rule and ((rule.fee_percent or 0) or (rule.fee_fixed or 0)):
+                        net = expected_net(p_amount, rule.fee_percent or 0, rule.fee_fixed or 0)
+                        if abs(b_amount - p_amount) < 0.01 or abs(b_amount - net) < 0.01:
+                            score += 3
+                            agreed_hit = True
+                    else:
+                        difference = abs(b_amount - p_amount)
+                        if difference < 0.01:
+                            score += 3
+                        elif difference < 1:
+                            score += 2
+                        elif difference < 5:
+                            score += 1
+                if agreed_hit:
+                    score = max(score, 4)
                 if b_date and p_date:
                     days = abs((b_date - p_date).days)
                     if days == 0:
