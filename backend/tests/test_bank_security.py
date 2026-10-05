@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.core.secrets import decrypt_secret  # noqa: E402
 from app.main import app  # noqa: E402
 
-IBAN = "ES7621000418401234567891"
+IBAN = "ES9121000418450200051332"
 DB = "postgresql://clearflow:clearflow_dev_password_2024@127.0.0.1:5432/clearflow_tenant_test"
 
 
@@ -65,7 +65,7 @@ def test_bank_number_is_encrypted_and_deletion_removes_movements():
         )
         assert saved.status_code == 201, saved.text
         account = saved.json()["companies"][0]["accounts"][0]
-        assert account["iban"] == "••••7891"
+        assert account["iban"] == "••••1332"
         assert IBAN not in saved.text
 
         stored = _query("SELECT iban FROM bank_accounts WHERE tenant_id = $1", uuid.UUID(home_id))
@@ -74,7 +74,7 @@ def test_bank_number_is_encrypted_and_deletion_removes_movements():
 
         listed = client.get(f"/api/v1/companies/{home_id}/bank-accounts", headers=headers)
         assert listed.status_code == 200, listed.text
-        assert listed.json()["items"][0]["iban"] == "••••7891"
+        assert listed.json()["items"][0]["iban"] == "••••1332"
 
         _query(
             """

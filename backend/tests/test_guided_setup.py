@@ -42,14 +42,14 @@ def test_guided_setup_links_shared_and_separate_accounts():
                         "accounts": [
                             {
                                 "bank_name": "Santander",
-                                "iban": "ES111",
+                                "iban": "ES91 2100 0418 4502 0005 1332",
                                 "currency": "EUR",
                                 "sources": ["cards"],
                                 "place_names": ["Restaurante Centro", "Restaurante Norte"],
                             },
                             {
                                 "bank_name": "BBVA",
-                                "iban": "ES222",
+                                "iban": "ES3600491500001234567890",
                                 "currency": "EUR",
                                 "sources": ["cards", "cash"],
                                 "place_names": ["Bar de copas"],
@@ -78,8 +78,8 @@ def test_guided_setup_links_shared_and_separate_accounts():
         shared = body["companies"][0]["accounts"][0]
         assert shared["place_names"] == ["Restaurante Centro", "Restaurante Norte"]
         assert shared["sources"] == ["cards"]
-        assert shared["iban"] == "••••S111"
-        assert "ES111" not in shared["iban"]
+        assert shared["iban"] == "••••1332"
+        assert "ES9121000418450200051332" not in saved.text
         assert body["companies"][1]["accounts"][0]["pending"] is True
 
         listed = client.get("/api/v1/companies", headers=headers)

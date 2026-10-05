@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.auth import _hash_password
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
+from app.core.iban import compact_iban, iban_ok
 from app.core.secrets import decrypt_secret, encrypt_secret, mask_secret
 from app.core.tenant_access import bind_tenant
 from app.models.account_profile import AccountProfile
@@ -187,12 +188,14 @@ def _validate_guided_setup(data: dict) -> list[dict]:
                 raise HTTPException(status_code=422, detail="Every account needs at least one place")
             pending = bool(account.get("pending"))
             bank_name = (account.get("bank_name") or "").strip()
-            iban = (account.get("iban") or "").strip().replace(" ", "")
+            iban = compact_iban(account.get("iban") or "")
             if len(iban) > 42:
                 raise HTTPException(status_code=422, detail="IBAN is too long")
             sources = _sources(account.get("sources"))
             if not pending and (not bank_name or not iban):
                 raise HTTPException(status_code=422, detail="Each account needs a bank and an IBAN, or mark it as not yet")
+            if not pending and not iban_ok(iban):
+                raise HTTPException(status_code=422, detail="IBAN does not check out")
             if not pending and not sources:
                 raise HTTPException(status_code=422, detail="Say what money arrives in each account")
             accounts.append({
@@ -391,11 +394,13 @@ async def add_bank_account(
     tenant_id = bind_tenant(current_user, tenant_id)
     require_owner(current_user, tenant_id)
     bank_name = (data.get("bank_name") or "").strip()
-    iban = (data.get("iban") or data.get("account_number") or "").strip().replace(" ", "")
+    iban = compact_iban(data.get("iban") or data.get("account_number") or "")
     if not bank_name or not iban:
         raise HTTPException(status_code=422, detail="Bank name and IBAN are required")
     if len(iban) > 42:
         raise HTTPException(status_code=422, detail="IBAN is too long")
+    if not iban_ok(iban):
+        raise HTTPException(status_code=422, detail="IBAN does not check out")
     currency = ((data.get("currency") or "EUR").strip() or "EUR")[:3]
     row = BankAccount(
         tenant_id=tenant_id,
