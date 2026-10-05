@@ -79,6 +79,13 @@ async def upload_provider_report(
 
     await db.commit()
 
+    try:
+        from app.services.open_matching import match_open_items, record_day
+        await match_open_items(db, tenant_id)
+        await record_day(db, tenant_id)
+    except Exception:
+        pass
+
     return {
         "message": f"Successfully processed {len(transactions)} {provider_name} transactions",
         "count": len(transactions)

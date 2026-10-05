@@ -3,6 +3,7 @@ FastAPI application entry point.
 Includes all routers, middleware, exception handlers, and app factory.
 """
 from __future__ import annotations
+import asyncio
 import os
 
 import uuid
@@ -67,9 +68,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:
         logger.warning("redis_unavailable", error=str(e))
 
+    stop_watch = asyncio.Event()
+    watch_task = None
+    if os.getenv("CLEARFLOW_WATCH") == "1":
+        from .services.open_matching import watch_loop
+        watch_task = asyncio.create_task(watch_loop(stop_watch))
+        logger.info("reconciliation_watch_started", seconds=os.getenv("CLEARFLOW_WATCH_SECONDS", "900"))
+
     yield
 
     # Shutdown
+    stop_watch.set()
+    if watch_task is not None:
+        watch_task.cancel()
     logger.info("app_shutting_down")
     await shared_engine.dispose()
 

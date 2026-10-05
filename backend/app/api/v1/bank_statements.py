@@ -94,11 +94,10 @@ async def upload_statement(
     if total_count == 0:
         raise HTTPException(status_code=400, detail="No valid transactions found in the file. Check the column headers.")
     
-    # Auto-trigger reconciliation after upload (non-blocking, ignore errors)
     try:
-        from app.services.reconciliation_service import ReconciliationService
-        service = ReconciliationService(db, tenant_id)
-        await service.run_reconciliation()
+        from app.services.open_matching import match_open_items, record_day
+        await match_open_items(db, tenant_id)
+        await record_day(db, tenant_id)
     except Exception:
         pass
     
