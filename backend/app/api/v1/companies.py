@@ -25,7 +25,7 @@ from app.models_orm import Tenant, TenantTier
 
 router = APIRouter()
 
-SITE_KINDS = {"restaurant", "bar", "chiringuito", "apartments"}
+SITE_KINDS = {"public", "online", "lodging", "restaurant", "bar", "chiringuito", "apartments"}
 MONEY_SOURCES = {"cards", "cash", "booking", "stripe"}
 MIN_PASSWORD_LENGTH = 10
 
@@ -162,7 +162,7 @@ def _validate_guided_setup(data: dict) -> list[dict]:
             if not place_name:
                 raise HTTPException(status_code=422, detail="Every place needs a name")
             if kind not in SITE_KINDS:
-                raise HTTPException(status_code=422, detail="Each place is a restaurant, bar, chiringuito, or apartments")
+                raise HTTPException(status_code=422, detail="Each place needs a general kind of business")
             key = place_name.lower()
             if key in seen_places:
                 raise HTTPException(status_code=422, detail=f"Place names must be unique: {place_name}")
@@ -516,7 +516,7 @@ async def add_site(
     if not name:
         raise HTTPException(status_code=422, detail="Site name is required")
     if kind not in SITE_KINDS:
-        raise HTTPException(status_code=422, detail="Site kind must be restaurant, bar, chiringuito, or apartments")
+        raise HTTPException(status_code=422, detail="Site kind must be a general kind of business")
     site = Site(id=uuid.uuid4(), tenant_id=tenant_id, name=name[:255], kind=kind)
     db.add(site)
     await db.commit()
