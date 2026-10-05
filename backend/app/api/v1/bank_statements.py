@@ -8,6 +8,7 @@ from datetime import datetime
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.secrets import encrypt_secret
 from app.core.tenant_access import bind_tenant
 from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
@@ -73,7 +74,7 @@ async def upload_statement(
             transaction_date=tx_date,
             reference=reference,
             balance=balance,
-            raw_data=str(row),
+            raw_data=encrypt_secret(str(row)),
             matched=0,
         )
         batch.append(tx)

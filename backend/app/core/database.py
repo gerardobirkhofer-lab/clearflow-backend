@@ -178,6 +178,25 @@ async def _encrypt_plain_account_numbers() -> None:
             await session.commit()
 
 
+async def _encrypt_plain_statement_rows() -> None:
+    """Encrypt original upload rows saved before this protection."""
+    from app.core.secrets import encrypt_secret
+    from app.models.bank_transaction import BankTransaction
+    from app.models.provider_transaction import ProviderTransaction
+
+    async with SharedSessionLocal() as session:
+        changed = False
+        for model in (BankTransaction, ProviderTransaction):
+            rows = await session.execute(
+                select(model).where(model.raw_data.isnot(None), ~model.raw_data.startswith("enc:v1:"))
+            )
+            for row in rows.scalars().all():
+                row.raw_data = encrypt_secret(str(row.raw_data))
+                changed = True
+        if changed:
+            await session.commit()
+
+
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
     Combines legacy and new ORM tables, skipping duplicates.
@@ -228,6 +247,7 @@ async def init_db() -> None:
         logger.warning(f"DB init warning (tables likely exist): {e}")
 
     await _encrypt_plain_account_numbers()
+    await _encrypt_plain_statement_rows()
 
     # Ensure default tenant exists (required for demo user)
     async with SharedSessionLocal() as session:

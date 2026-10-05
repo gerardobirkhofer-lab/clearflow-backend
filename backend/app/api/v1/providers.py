@@ -8,6 +8,7 @@ from datetime import datetime
 
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.secrets import encrypt_secret
 from app.core.tenant_access import bind_tenant
 from app.models.provider_transaction import ProviderTransaction
 from app.models.provider import Provider
@@ -65,7 +66,7 @@ async def upload_provider_report(
             amount=amount,
             transaction_date=tx_date,
             reference=reference,
-            raw_data=str(row),
+            raw_data=encrypt_secret(str(row)),
             matched=0,
         )
         transactions.append(tx)
