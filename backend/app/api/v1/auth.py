@@ -234,8 +234,17 @@ async def forgot_password(data: dict, request: Request):
         link = f"{frontend}/login?reset={token}"
         await get_email_service().send_email(
             to=user.email,
-            subject="Reset your ClearFlow password",
-            body_text=f"Reset your password: {link}\nThis link expires in 30 minutes.",
+            subject="Elige una contraseña nueva en ClearFlow",
+            body_text=(
+                "Para elegir una contraseña nueva, abre este enlace:\n"
+                f"{link}\n\n"
+                "El enlace caduca en 30 minutos. Si no pediste el cambio, puedes ignorar este mensaje."
+            ),
+            body_html=(
+                "<p>Para elegir una contraseña nueva, abre este enlace:</p>"
+                f"<p><a href=\"{link}\">{link}</a></p>"
+                "<p>El enlace caduca en 30 minutos. Si no pediste el cambio, puedes ignorar este mensaje.</p>"
+            ),
         )
     return {"detail": "If that email is registered, a reset link is on its way."}
 
