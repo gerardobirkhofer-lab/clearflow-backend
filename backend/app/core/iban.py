@@ -19,7 +19,7 @@ IBAN_LENGTHS = {
 
 
 def compact_iban(value: str) -> str:
-    return "".join((value or "").split()).upper()
+    return "".join((value or "").replace("-", "").split()).upper()
 
 
 def iban_ok(value: str) -> bool:

@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.v1.auth import _hash_password
 from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
-from app.core.iban import compact_iban, iban_ok
+from app.core.account_number import AccountNumberError, normalize_account
 from app.core.secrets import decrypt_secret, encrypt_secret, mask_secret
 from app.core.tenant_access import bind_tenant
 from app.models.account_profile import AccountProfile
@@ -188,22 +188,40 @@ def _validate_guided_setup(data: dict) -> list[dict]:
                 raise HTTPException(status_code=422, detail="Every account needs at least one place")
             pending = bool(account.get("pending"))
             bank_name = (account.get("bank_name") or "").strip()
-            iban = compact_iban(account.get("iban") or "")
-            if len(iban) > 42:
-                raise HTTPException(status_code=422, detail="IBAN is too long")
             sources = _sources(account.get("sources"))
-            if not pending and (not bank_name or not iban):
-                raise HTTPException(status_code=422, detail="Each account needs a bank and an IBAN, or mark it as not yet")
-            if not pending and not iban_ok(iban):
-                raise HTTPException(status_code=422, detail="IBAN does not check out")
-            if not pending and not sources:
+            currency = ((account.get("currency") or "EUR").strip() or "EUR")[:3]
+            if pending:
+                accounts.append({
+                    "bank_name": bank_name[:100],
+                    "iban": "",
+                    "country": "",
+                    "checked": False,
+                    "currency": currency,
+                    "sources": sources,
+                    "pending": True,
+                    "place_names": linked,
+                })
+                continue
+            if not bank_name or not (account.get("iban") or "").strip():
+                raise HTTPException(status_code=422, detail="Each account needs a bank and an account number, or mark it as not yet")
+            if len("".join(str(account.get("iban") or "").split())) > 42:
+                raise HTTPException(status_code=422, detail="Account number is too long")
+            try:
+                normalized = normalize_account(account.get("country"), account.get("iban") or "")
+            except AccountNumberError as exc:
+                raise HTTPException(status_code=422, detail=exc.detail) from exc
+            if not sources:
                 raise HTTPException(status_code=422, detail="Say what money arrives in each account")
+            if normalized["country"] == "AR":
+                currency = "ARS"
             accounts.append({
                 "bank_name": bank_name[:100],
-                "iban": iban,
-                "currency": ((account.get("currency") or "EUR").strip() or "EUR")[:3],
+                "iban": normalized["number"],
+                "country": normalized["country"],
+                "checked": normalized["checked"],
+                "currency": currency,
                 "sources": sources,
-                "pending": pending,
+                "pending": False,
                 "place_names": linked,
             })
         missing = place_names - covered
@@ -291,6 +309,8 @@ async def apply_guided_setup(
                 currency=account["currency"],
                 sources=json.dumps(account["sources"]),
                 pending=1 if account["pending"] else 0,
+                account_country=account["country"] or None,
+                account_checked=1 if account["checked"] else 0,
                 is_active=1,
             )
             db.add(row)
@@ -305,6 +325,8 @@ async def apply_guided_setup(
                 "id": row.id,
                 "bank_name": row.bank_name or "",
                 "iban": mask_secret(plain_iban),
+                "country": account["country"],
+                "checked": account["checked"],
                 "currency": row.currency,
                 "pending": bool(row.pending),
                 "sources": account["sources"],
@@ -365,6 +387,8 @@ async def _bank_accounts_for(db: AsyncSession, tenant_id: uuid.UUID) -> list[dic
             "id": account.id,
             "bank_name": account.bank_name or account.name,
             "iban": _public_iban(account.iban or account.account_number),
+            "country": account.account_country or "",
+            "checked": None if account.account_checked is None else bool(account.account_checked),
             "currency": account.currency,
             "pending": bool(account.pending),
             "place_names": [name for name in grouped.get(account.id, []) if name],
@@ -394,34 +418,40 @@ async def add_bank_account(
     tenant_id = bind_tenant(current_user, tenant_id)
     require_owner(current_user, tenant_id)
     bank_name = (data.get("bank_name") or "").strip()
-    iban = compact_iban(data.get("iban") or data.get("account_number") or "")
-    if not bank_name or not iban:
-        raise HTTPException(status_code=422, detail="Bank name and IBAN are required")
-    if len(iban) > 42:
-        raise HTTPException(status_code=422, detail="IBAN is too long")
-    if not iban_ok(iban):
-        raise HTTPException(status_code=422, detail="IBAN does not check out")
-    currency = ((data.get("currency") or "EUR").strip() or "EUR")[:3]
+    raw_number = data.get("iban") or data.get("account_number") or ""
+    if not bank_name or not str(raw_number).strip():
+        raise HTTPException(status_code=422, detail="Bank name and account number are required")
+    if len("".join(str(raw_number).split())) > 42:
+        raise HTTPException(status_code=422, detail="Account number is too long")
+    try:
+        cleaned = normalize_account(data.get("country"), raw_number)
+    except AccountNumberError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail) from exc
+    currency = "ARS" if cleaned["country"] == "AR" else ((data.get("currency") or "EUR").strip() or "EUR")[:3]
     row = BankAccount(
         tenant_id=tenant_id,
         name=bank_name[:100],
         bank_name=bank_name[:100],
-        iban=encrypt_secret(iban),
+        iban=encrypt_secret(cleaned["number"]),
         currency=currency,
         pending=0,
+        account_country=cleaned["country"],
+        account_checked=1 if cleaned["checked"] else 0,
         is_active=1,
     )
     db.add(row)
     await db.flush()
     _remember(db, current_user, tenant_id, "bank_account.saved", row.id, {
         "bank_name": bank_name[:100],
-        "iban": mask_secret(iban),
+        "iban": mask_secret(cleaned["number"]),
     })
     await db.commit()
     return {
         "id": row.id,
         "bank_name": row.bank_name,
-        "iban": mask_secret(iban),
+        "iban": mask_secret(cleaned["number"]),
+        "country": cleaned["country"],
+        "checked": cleaned["checked"],
         "currency": row.currency,
         "pending": False,
         "place_names": [],

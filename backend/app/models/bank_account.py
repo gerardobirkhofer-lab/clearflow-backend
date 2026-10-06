@@ -14,6 +14,8 @@ class BankAccount(Base):
     currency = Column(String(10), default="EUR")
     sources = Column(Text, nullable=True)
     pending = Column(Integer, default=0)
+    account_country = Column(String(8), nullable=True)
+    account_checked = Column(Integer, nullable=True)
     opening_balance = Column(Float, nullable=True)
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, server_default=func.now())
