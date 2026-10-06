@@ -42,8 +42,14 @@ def _as_uuid(value) -> uuid.UUID:
     return uuid.UUID(str(value))
 
 
+def _place_key(name: str, location: str) -> str:
+    if location:
+        return f"{name} · {location}"
+    return name
+
+
 def _site_out(site: Site) -> dict:
-    return {"id": _as_uuid(site.id), "name": site.name, "kind": site.kind}
+    return {"id": _as_uuid(site.id), "name": site.name, "location": site.location or "", "kind": site.kind}
 
 
 def _company_out(tenant: Tenant, role: str, sites: list[Site]) -> dict:
@@ -159,19 +165,25 @@ def _validate_guided_setup(data: dict) -> list[dict]:
         places = []
         for place in company.get("places") or []:
             place_name = (place.get("name") or "").strip()
+            location = (place.get("location") or "").strip()[:80]
             kind = (place.get("kind") or "").strip().lower()
             if not place_name:
                 raise HTTPException(status_code=422, detail="Every place needs a name")
             if kind not in SITE_KINDS:
                 raise HTTPException(status_code=422, detail="Each place needs a general kind of business")
-            key = place_name.lower()
-            if key in seen_places:
-                raise HTTPException(status_code=422, detail=f"Place names must be unique: {place_name}")
-            seen_places.add(key)
-            places.append({"name": place_name[:255], "kind": kind})
+            key = _place_key(place_name, location)
+            if key.lower() in seen_places:
+                detail = (
+                    f"Places with the same name need a different location: {place_name}"
+                    if not location
+                    else f"Two places share the same name and location: {place_name}"
+                )
+                raise HTTPException(status_code=422, detail=detail)
+            seen_places.add(key.lower())
+            places.append({"name": place_name[:255], "location": location, "kind": kind, "key": key})
         if not places:
             raise HTTPException(status_code=422, detail=f"{name} needs at least one place")
-        place_names = {place["name"] for place in places}
+        place_names = {place["key"] for place in places}
         accounts = []
         covered: set[str] = set()
         for account in company.get("accounts") or []:
@@ -292,9 +304,15 @@ async def apply_guided_setup(
         sites_by_name = {}
         site_rows = []
         for place in company["places"]:
-            site = Site(id=uuid.uuid4(), tenant_id=tenant_id, name=place["name"], kind=place["kind"])
+            site = Site(
+                id=uuid.uuid4(),
+                tenant_id=tenant_id,
+                name=place["name"],
+                location=place["location"] or None,
+                kind=place["kind"],
+            )
             db.add(site)
-            sites_by_name[place["name"]] = site
+            sites_by_name[place["key"]] = site
             site_rows.append(site)
         await db.flush()
         account_rows = []

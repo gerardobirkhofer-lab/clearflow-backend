@@ -117,3 +117,55 @@ def test_guided_setup_links_shared_and_separate_accounts():
             json={"companies": [{"name": "X", "places": [{"name": "Y", "kind": "bar"}], "accounts": []}]},
         )
         assert blocked.status_code == 403
+
+
+def test_branches_can_share_a_name_when_the_location_differs():
+    suffix = uuid.uuid4().hex[:8]
+    with TestClient(app) as client:
+        owner = client.post(
+            "/api/v1/auth/register",
+            json={"email": f"branch-{suffix}@example.com", "password": "branch-password", "full_name": "Sucursales"},
+        )
+        assert owner.status_code == 201, owner.text
+        headers = {"Authorization": f"Bearer {owner.json()['token']}"}
+        saved = client.post(
+            "/api/v1/companies/guided-setup",
+            headers=headers,
+            json={
+                "companies": [{
+                    "name": "Empanadas La Cala",
+                    "places": [
+                        {"name": "Empanadas La Cala", "location": "Marbella centro", "kind": "public"},
+                        {"name": "Empanadas La Cala", "location": "Av. del Mar", "kind": "public"},
+                    ],
+                    "accounts": [{
+                        "pending": True,
+                        "place_names": [
+                            "Empanadas La Cala · Marbella centro",
+                            "Empanadas La Cala · Av. del Mar",
+                        ],
+                    }],
+                }],
+            },
+        )
+        assert saved.status_code == 201, saved.text
+        sites = saved.json()["companies"][0]["sites"]
+        assert {site["location"] for site in sites} == {"Marbella centro", "Av. del Mar"}
+        assert {site["name"] for site in sites} == {"Empanadas La Cala"}
+
+        repeated = client.post(
+            "/api/v1/companies/guided-setup",
+            headers=headers,
+            json={
+                "companies": [{
+                    "name": "Empanadas La Cala",
+                    "places": [
+                        {"name": "Empanadas La Cala", "kind": "public"},
+                        {"name": "Empanadas La Cala", "kind": "public"},
+                    ],
+                    "accounts": [{"pending": True, "place_names": ["Empanadas La Cala"]}],
+                }],
+            },
+        )
+        assert repeated.status_code == 422, repeated.text
+        assert repeated.json()["detail"] == "Places with the same name need a different location: Empanadas La Cala"

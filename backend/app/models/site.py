@@ -14,5 +14,6 @@ class Site(Base):
     id = Column(UUID, primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID, nullable=False, index=True)
     name = Column(String(255), nullable=False)
+    location = Column(String(80), nullable=True)
     kind = Column(String(32), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
