@@ -32,6 +32,7 @@ from .api.v1 import (
     bank_statements,
     providers,
     disputes,
+    expenses,
     tpv_reports,
     fee_structures,
     reconciliation,
@@ -168,6 +169,7 @@ def create_app() -> FastAPI:
     app.include_router(bank_statements.router, prefix="/api/v1/bank-statements", tags=["bank-statements"])
     app.include_router(providers.router, prefix="/api/v1/providers", tags=["providers"])
     app.include_router(disputes.router, prefix="/api/v1/disputes", tags=["disputes"])
+    app.include_router(expenses.router, prefix="/api/v1/expenses", tags=["expenses"])
     app.include_router(tpv_reports.router, prefix="/api/v1", tags=["tpv-reports"])
     app.include_router(fee_structures.router, prefix="/api/v1", tags=["fee-structures"])
     app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["reconciliation"])
