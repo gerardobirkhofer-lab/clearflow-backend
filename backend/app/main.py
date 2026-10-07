@@ -34,6 +34,7 @@ from .api.v1 import (
     disputes,
     expenses,
     forecast_setup,
+    card_operations,
     panel,
     tpv_reports,
     fee_structures,
@@ -174,6 +175,7 @@ def create_app() -> FastAPI:
     app.include_router(expenses.router, prefix="/api/v1/expenses", tags=["expenses"])
     app.include_router(panel.router, prefix="/api/v1", tags=["panel"])
     app.include_router(forecast_setup.router, prefix="/api/v1", tags=["forecast"])
+    app.include_router(card_operations.router, prefix="/api/v1", tags=["card-operations"])
     app.include_router(tpv_reports.router, prefix="/api/v1", tags=["tpv-reports"])
     app.include_router(fee_structures.router, prefix="/api/v1", tags=["fee-structures"])
     app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["reconciliation"])

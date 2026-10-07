@@ -16,6 +16,7 @@ from app.api.v1.companies import companies_for_user
 from app.core.auth import CurrentUser
 from app.models.account_profile import AccountProfile
 from app.models.bank_account import BankAccount
+from app.models.card_operation import CardOperation
 from app.models.bank_account_site import BankAccountSite
 from app.models.bank_transaction import BankTransaction
 from app.models.expense import Expense
@@ -140,6 +141,87 @@ async def _remember_open(db: AsyncSession, tenant_id, today: date, places: dict)
     return row.checked_at
 
 
+def _when_day(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def claim_lines(sales, operations, contracts) -> dict[str, list]:
+    """Name the ticket. A short fee goes to the acquirer. A sale with no card charge stays in the place."""
+    used_sales = set()
+    used_ops = set()
+    by_ref = {}
+    for sale in sales:
+        if sale.reference:
+            by_ref.setdefault(str(sale.reference), []).append(sale)
+    pairs = []
+    for operation in operations:
+        partner = None
+        if operation.reference and by_ref.get(str(operation.reference)):
+            for sale in by_ref[str(operation.reference)]:
+                if id(sale) not in used_sales:
+                    partner = sale
+                    break
+        if partner is None:
+            op_day = _when_day(operation.operated_at)
+            for sale in sales:
+                if id(sale) in used_sales:
+                    continue
+                if str(sale.site_id or "") != str(operation.site_id):
+                    continue
+                if _when_day(sale.transaction_date) != op_day:
+                    continue
+                if abs(_money(sale.amount) - _money(operation.amount)) > 0.01:
+                    continue
+                partner = sale
+                break
+        if partner is not None:
+            used_sales.add(id(partner))
+            used_ops.add(id(operation))
+            pairs.append((partner, operation))
+
+    lines: dict[str, list] = {}
+    covered = {(str(operation.site_id), _when_day(operation.operated_at)) for operation in operations}
+    for sale, operation in pairs:
+        rule = contracts.get((sale.provider_name or "").strip().lower())
+        if rule is None or operation.fee_amount is None:
+            continue
+        expected_fee = _money(sale.amount) - expected_net(_money(sale.amount), rule.fee_percent or 0, rule.fee_fixed or 0)
+        short = round(_money(operation.fee_amount) - expected_fee, 2)
+        if short <= 0.01:
+            continue
+        key = str(sale.site_id)
+        lines.setdefault(key, []).append({
+            "kind": "liquidador",
+            "concept": sale.concept or sale.provider_name,
+            "amount": _money(sale.amount),
+            "sold_on": _when_day(sale.transaction_date).isoformat() if _when_day(sale.transaction_date) else None,
+            "auth_code": operation.auth_code,
+            "short": short,
+            "detail": "La comisión de esta operación es mayor que el contrato.",
+        })
+    for sale in sales:
+        if id(sale) in used_sales:
+            continue
+        day = _when_day(sale.transaction_date)
+        key = str(sale.site_id or "")
+        if (key, day) not in covered:
+            continue
+        lines.setdefault(key, []).append({
+            "kind": "caja",
+            "concept": sale.concept or sale.provider_name,
+            "amount": _money(sale.amount),
+            "sold_on": day.isoformat() if day else None,
+            "auth_code": None,
+            "short": _money(sale.amount),
+            "detail": "Este ticket no tiene una operación de tarjeta.",
+        })
+    return lines
+
+
 def _empty_place(site, company) -> dict:
     return {
         "site_id": str(site["id"]) if site else None,
@@ -164,6 +246,7 @@ def _empty_place(site, company) -> dict:
         "expenses": 0.0,
         "earning": 0.0,
         "verdict": "vas_bien",
+        "claims": [],
     }
 
 
@@ -229,6 +312,13 @@ async def build_panel(db: AsyncSession, current_user: CurrentUser) -> dict:
                 bucket["unresolved"] = _money(bucket["unresolved"] + amount)
                 bucket["uncollected_amount"] = _money(bucket["uncollected_amount"] + amount)
                 bucket["uncollected_count"] += 1
+
+        operations = (
+            await db.execute(select(CardOperation).where(CardOperation.tenant_id == tenant_id))
+        ).scalars().all()
+        for site_key, lines in claim_lines(sales, operations, contracts).items():
+            if site_key in buckets:
+                buckets[site_key]["claims"] = lines
 
         previous = await _previous_open(db, tenant_id, today)
         remembered = {}

@@ -189,3 +189,46 @@ def test_horizon_shows_profit_for_twelve_months():
         assert lifted["base"] == 1000
         assert lifted["sales"] == 1100
         assert lifted["earning"] == 450
+
+
+def test_a_short_card_fee_names_the_ticket_for_the_acquirer():
+    today = madrid_today()
+    with TestClient(app) as client:
+        tenant_id, headers = _owner(client)
+        site = _site(client, tenant_id, headers, "Local")
+        contract = client.post(
+            f"/api/v1/companies/{tenant_id}/contracts",
+            headers=headers,
+            data={"provider_name": "Redsys", "fee_percent": "10", "payout_days": "1"},
+        )
+        assert contract.status_code == 200, contract.text
+        for concept, amount in (("Ración", "40"), ("Café", "15")):
+            sale = client.post(
+                f"/api/v1/companies/{tenant_id}/sites/{site}/sales",
+                headers=headers,
+                json={"amount": amount, "sold_on": today.isoformat(), "provider": "Redsys", "concept": concept},
+            )
+            assert sale.status_code == 201, sale.text
+        operation = client.post(
+            "/api/v1/card-operations",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+            json={
+                "site_id": site,
+                "operated_at": today.isoformat(),
+                "amount": "40",
+                "fee_amount": "8",
+                "auth_code": "ABC123",
+                "terminal": "001",
+            },
+        )
+        assert operation.status_code == 200, operation.text
+
+        panel = client.get("/api/v1/panel", headers=headers)
+        assert panel.status_code == 200, panel.text
+        claims = {item["concept"]: item for item in panel.json()["places"][0]["claims"]}
+        assert claims["Ración"]["kind"] == "liquidador"
+        assert claims["Ración"]["auth_code"] == "ABC123"
+        assert claims["Ración"]["short"] == 4
+        assert claims["Café"]["kind"] == "caja"
+        assert claims["Café"]["auth_code"] is None
