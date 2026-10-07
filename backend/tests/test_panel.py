@@ -1,6 +1,8 @@
 """Each place keeps its own sales, and a bill lands on the day the client set."""
 from __future__ import annotations
 
+import asyncio
+import io
 import os
 import uuid
 from datetime import timedelta
@@ -11,10 +13,13 @@ os.environ.setdefault(
 )
 os.environ.setdefault("JWT_SECRET_KEY", "test-tenant-isolation-secret")
 
+import asyncpg  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.main import app  # noqa: E402
 from app.services.open_matching import madrid_today  # noqa: E402
+
+DB = "postgresql://clearflow:clearflow_dev_password_2024@127.0.0.1:5432/clearflow_tenant_test"
 
 
 def _owner(client: TestClient):
@@ -26,6 +31,20 @@ def _owner(client: TestClient):
     assert owner.status_code == 201, owner.text
     body = owner.json()
     return body["user"]["tenant_id"], {"Authorization": f"Bearer {body['token']}"}
+
+
+def _query(sql: str, *args):
+    async def run():
+        conn = await asyncpg.connect(DB)
+        try:
+            if sql.lstrip().upper().startswith("SELECT"):
+                return await conn.fetch(sql, *args)
+            await conn.execute(sql, *args)
+            return []
+        finally:
+            await conn.close()
+
+    return asyncio.run(run())
 
 
 def _site(client, tenant_id, headers, name):
@@ -232,3 +251,104 @@ def test_a_short_card_fee_names_the_ticket_for_the_acquirer():
         assert claims["Ración"]["short"] == 4
         assert claims["Café"]["kind"] == "caja"
         assert claims["Café"]["auth_code"] is None
+        place = panel.json()["places"][0]
+        lines = place["lines"]
+        uncollected = [item for item in lines if item["kind"] == "uncollected"]
+        assert round(sum(item["amount"] for item in uncollected), 2) == place["uncollected_amount"]
+        cafe = next(item for item in uncollected if item["concept"] == "Café")
+        assert "tarjeta" in cafe["detail"]
+        racion = next(item for item in uncollected if item["concept"] == "Ración")
+        assert racion["amount"] == 40
+        assert racion["auth_code"] == "ABC123"
+        assert racion["extra"] == 4
+
+
+def test_delay_days_square_with_the_store_cards():
+    today = madrid_today()
+    with TestClient(app) as client:
+        tenant_id, headers = _owner(client)
+        site = _site(client, tenant_id, headers, "Local")
+        contract = client.post(
+            f"/api/v1/companies/{tenant_id}/contracts",
+            headers=headers,
+            data={"provider_name": "Redsys", "fee_percent": "10", "payout_days": "1"},
+        )
+        assert contract.status_code == 200, contract.text
+
+        def sell(amount, day, concept):
+            saved = client.post(
+                f"/api/v1/companies/{tenant_id}/sites/{site}/sales",
+                headers=headers,
+                json={"amount": amount, "sold_on": day.isoformat(), "provider": "Redsys", "concept": concept},
+            )
+            assert saved.status_code == 201, saved.text
+            return saved.json()["id"]
+
+        late_sale = today - timedelta(days=10)
+        late_bank = today - timedelta(days=6)
+        on_time_sale = today - timedelta(days=2)
+        on_time_bank = today - timedelta(days=1)
+        open_old = today - timedelta(days=5)
+        late_id = sell("200", late_sale, "Cena")
+        on_time_id = sell("50", on_time_sale, "Menú")
+        sell("100", open_old, "Terraza")
+        sell("40", today, "Barra")
+
+        bank_csv = (
+            "Fecha;Concepto;Importe;Saldo\n"
+            f"{late_bank.strftime('%d/%m/%Y')};ABONO TARDE;+170,00;170,00\n"
+            f"{on_time_bank.strftime('%d/%m/%Y')};ABONO DIA;+44,00;214,00\n"
+        )
+        uploaded = client.post(
+            "/api/v1/bank-statements/upload",
+            headers=headers,
+            data={"tenant_id": tenant_id},
+            files={"file": ("banco.csv", io.BytesIO(bank_csv.encode()), "text/csv")},
+        )
+        assert uploaded.status_code == 200, uploaded.text
+        banks = {
+            row["concept"]: row["id"]
+            for row in _query(
+                "SELECT id, concept FROM bank_transactions WHERE tenant_id = $1",
+                uuid.UUID(tenant_id),
+            )
+        }
+        _query(
+            "UPDATE provider_transactions SET matched = 1, matched_bank_tx_id = $2 WHERE id = $1",
+            late_id,
+            banks["ABONO TARDE"],
+        )
+        _query(
+            "UPDATE provider_transactions SET matched = 1, matched_bank_tx_id = $2 WHERE id = $1",
+            on_time_id,
+            banks["ABONO DIA"],
+        )
+        saved_rate = client.put(
+            "/api/v1/account/profile",
+            headers=headers,
+            json={"payload": {"debt_rate_percent": 10}, "onboarding_complete": True},
+        )
+        assert saved_rate.status_code == 200, saved_rate.text
+
+        panel = client.get("/api/v1/panel", headers=headers)
+        assert panel.status_code == 200, panel.text
+        place = panel.json()["places"][0]
+        assert place["fees"] == 11
+        assert place["late_amount"] == 170
+        assert place["late_days"] == 3
+        assert place["uncollected_amount"] == 140
+        assert place["uncollected_count"] == 2
+        by_day = {row["days"]: row for row in place["delays"]}
+        assert by_day[0] == {"days": 0, "late": 0, "uncollected": 40, "fees": 1}
+        assert by_day[3] == {"days": 3, "late": 170, "uncollected": 0, "fees": 10}
+        assert by_day[4] == {"days": 4, "late": 0, "uncollected": 100, "fees": 0}
+        assert round(sum(row["late"] for row in place["delays"]), 2) == place["late_amount"]
+        assert round(sum(row["fees"] for row in place["delays"]), 2) == place["fees"]
+        assert round(sum(row["uncollected"] for row in place["delays"]), 2) == place["uncollected_amount"]
+        assert place["late_cost"] == round(170 * 10 / 100 * 3 / 365, 2)
+        lost = 0.0
+        for row in place["delays"]:
+            lost += (row["late"] + row["uncollected"] + row["fees"]) * 10 / 100 * row["days"] / 365
+        assert round(lost, 2) == round((100 * 4 + 10 * 3 + 170 * 3) * 10 / 100 / 365, 2)
+        for kind, total in (("fee", 11), ("late", 170), ("uncollected", 140)):
+            assert round(sum(item["amount"] for item in place["lines"] if item["kind"] == kind), 2) == total

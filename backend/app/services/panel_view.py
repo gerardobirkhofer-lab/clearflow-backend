@@ -68,6 +68,58 @@ def late_cost(amount: float, days: int, rate) -> float | None:
     return round(float(amount) * float(rate) / 100.0 * int(days) / 365.0, 2)
 
 
+def _bump(bucket: dict, days: int, kind: str, amount: float) -> None:
+    waited = int(days)
+    row = bucket["_delay"].setdefault(waited, {"days": waited, "late": 0.0, "uncollected": 0.0, "fees": 0.0})
+    row[kind] = _money(row[kind] + amount)
+
+
+def _line(bucket: dict, kind: str, concept, amount: float, days: int, sold_on, detail: str) -> None:
+    bucket["_lines"].append({
+        "kind": kind,
+        "concept": concept,
+        "amount": _money(amount),
+        "days": int(days),
+        "sold_on": sold_on,
+        "detail": detail,
+        "auth_code": None,
+        "extra": None,
+    })
+
+
+def _annotate(lines: list, claims: list) -> None:
+    """A named ticket explains a line. It does not add a second amount."""
+    for claim in claims:
+        for line in lines:
+            if line["kind"] != "uncollected" or line.get("_noted"):
+                continue
+            if line["concept"] != claim.get("concept") or line["sold_on"] != claim.get("sold_on"):
+                continue
+            if abs(_money(line["amount"]) - _money(claim.get("amount"))) > 0.02:
+                continue
+            line["detail"] = claim.get("detail") or line["detail"]
+            line["auth_code"] = claim.get("auth_code")
+            line["extra"] = claim.get("short") if claim.get("kind") == "liquidador" else None
+            line["_noted"] = True
+            break
+    for line in lines:
+        line.pop("_noted", None)
+
+
+def _publish_delays(bucket: dict, rate) -> None:
+    raw = bucket.pop("_delay", {})
+    bucket["delays"] = [raw[day] for day in sorted(raw)]
+    bucket["lines"] = bucket.pop("_lines", [])
+    cost = 0.0
+    seen = False
+    if rate is not None:
+        for row in bucket["delays"]:
+            if row["late"] > 0 and row["days"] > 0:
+                seen = True
+                cost += float(row["late"]) * float(rate) / 100.0 * int(row["days"]) / 365.0
+    bucket["late_cost"] = round(cost, 2) if seen else None
+
+
 def _bill_on(expense: Expense, day: date) -> bool:
     if expense.due_on is not None:
         return expense.due_on == day
@@ -247,6 +299,8 @@ def _empty_place(site, company) -> dict:
         "earning": 0.0,
         "verdict": "vas_bien",
         "claims": [],
+        "delays": [],
+        "lines": [],
     }
 
 
@@ -267,6 +321,8 @@ async def build_panel(db: AsyncSession, current_user: CurrentUser) -> dict:
         rate = rates.get(str(tenant_id))
         for bucket in list(buckets.values()) + [loose]:
             bucket["debt_rate"] = rate
+            bucket["_delay"] = {}
+            bucket["_lines"] = []
 
         contracts = {
             (row.name or "").strip().lower(): row
@@ -294,31 +350,51 @@ async def build_panel(db: AsyncSession, current_user: CurrentUser) -> dict:
                 bucket["contract_fees"] = _money(
                     bucket["contract_fees"] + amount - expected_net(amount, rule.fee_percent or 0, rule.fee_fixed or 0)
                 )
+            sold_on = _when_day(sale.transaction_date)
+            sold_iso = sold_on.isoformat() if sold_on else None
+            concept = sale.concept or sale.provider_name
             if int(sale.matched or 0) == 1:
                 bucket["collected"] = _money(bucket["collected"] + amount)
                 bank = banks.get(sale.matched_bank_tx_id)
                 if rule is not None and bank is not None:
                     net = expected_net(amount, rule.fee_percent or 0, rule.fee_fixed or 0)
                     short = round(net - _money(bank.amount), 2)
-                    if short > 0.01:
-                        bucket["fees"] = _money(bucket["fees"] + short)
                     arrival = expected_arrival(sale.transaction_date, rule.credit_delay_days, rule.batch_day_of_week)
                     bank_day = bank.transaction_date.date() if isinstance(bank.transaction_date, datetime) else bank.transaction_date
-                    if arrival and bank_day and bank_day > arrival:
-                        days = (bank_day - arrival).days
-                        bucket["late_amount"] = _money(bucket["late_amount"] + _money(bank.amount))
-                        bucket["late_days"] = max(bucket["late_days"], days)
+                    waited = (bank_day - arrival).days if arrival and bank_day and bank_day > arrival else 0
+                    if short > 0.01:
+                        bucket["fees"] = _money(bucket["fees"] + short)
+                        _bump(bucket, waited, "fees", short)
+                        _line(bucket, "fee", concept, short, waited, sold_iso, "El banco ingresó menos de lo que el contrato deja, descontada la comisión.")
+                    if waited > 0:
+                        landed = _money(bank.amount)
+                        bucket["late_amount"] = _money(bucket["late_amount"] + landed)
+                        bucket["late_days"] = max(bucket["late_days"], waited)
+                        _bump(bucket, waited, "late", landed)
+                        _line(bucket, "late", concept, landed, waited, sold_iso, "Este cobro llegó después del día del contrato.")
             else:
                 bucket["unresolved"] = _money(bucket["unresolved"] + amount)
                 bucket["uncollected_amount"] = _money(bucket["uncollected_amount"] + amount)
                 bucket["uncollected_count"] += 1
+                arrival = None
+                if rule is not None:
+                    arrival = expected_arrival(sale.transaction_date, rule.credit_delay_days, rule.batch_day_of_week)
+                if arrival is not None:
+                    waited = (today - arrival).days if today > arrival else 0
+                elif sold_on is not None and today > sold_on:
+                    waited = (today - sold_on).days
+                else:
+                    waited = 0
+                _bump(bucket, waited, "uncollected", amount)
+                _line(bucket, "uncollected", concept, amount, waited, sold_iso, "Venta hecha y todavía no cobrada.")
 
         operations = (
             await db.execute(select(CardOperation).where(CardOperation.tenant_id == tenant_id))
         ).scalars().all()
-        for site_key, lines in claim_lines(sales, operations, contracts).items():
+        for site_key, claims in claim_lines(sales, operations, contracts).items():
             if site_key in buckets:
-                buckets[site_key]["claims"] = lines
+                buckets[site_key]["claims"] = claims
+                _annotate(buckets[site_key]["_lines"], claims)
 
         previous = await _previous_open(db, tenant_id, today)
         remembered = {}
@@ -327,7 +403,7 @@ async def build_panel(db: AsyncSession, current_user: CurrentUser) -> dict:
             bucket["carried_open"] = carried
             bucket["resolved"] = resolved
             bucket["this_check"] = opened
-            bucket["late_cost"] = late_cost(bucket["late_amount"], bucket["late_days"], rate)
+            _publish_delays(bucket, rate)
             remembered[key] = bucket["unresolved"]
         checked_at = await _remember_open(db, tenant_id, today, remembered)
 
