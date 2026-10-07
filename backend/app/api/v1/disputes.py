@@ -5,8 +5,10 @@ from sqlalchemy import select, func, and_
 from datetime import datetime, timedelta
 from typing import Optional
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
 from app.core.email import get_email_service
+from app.core.tenant_access import bind_tenant
 from app.models.dispute import Dispute
 from app.models.dispute_email_log import DisputeEmailLog
 from app.models.provider import Provider
@@ -21,8 +23,10 @@ async def list_disputes(
     provider: Optional[str] = Query(None),
     days_min: Optional[int] = Query(None),
     days_max: Optional[int] = Query(None),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    tenant_id = bind_tenant(current_user, tenant_id)
     query = select(Dispute).where(Dispute.tenant_id == tenant_id)
     
     if status:
@@ -62,7 +66,12 @@ async def list_disputes(
 
 
 @router.get("/summary")
-async def get_dispute_summary(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_dispute_summary(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     # Total disputes
     total_result = await db.execute(
         select(func.count(Dispute.id)).where(Dispute.tenant_id == tenant_id)
@@ -186,8 +195,10 @@ async def create_dispute(
     amount: float,
     description: str = "",
     expected_resolution_days: int = 14,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    tenant_id = bind_tenant(current_user, tenant_id)
     dispute = Dispute(
         tenant_id=tenant_id,
         provider_name=provider_name,
@@ -208,9 +219,15 @@ async def resolve_dispute(
     dispute_id: int,
     recovery_amount: float,
     notes: str = "",
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
-    result = await db.execute(select(Dispute).where(Dispute.id == dispute_id))
+    result = await db.execute(
+        select(Dispute).where(
+            Dispute.id == dispute_id,
+            Dispute.tenant_id == current_user.tenant_id,
+        )
+    )
     dispute = result.scalar_one_or_none()
     if not dispute:
         raise HTTPException(status_code=404, detail="Dispute not found")
@@ -230,8 +247,10 @@ async def send_dispute_email(
     dispute_id: int,
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """Send dispute report email to provider's configured dispute email."""
+    tenant_id = bind_tenant(current_user, tenant_id)
     result = await db.execute(
         select(Dispute).where(
             Dispute.id == dispute_id,
@@ -335,8 +354,10 @@ async def send_dispute_email_direct(
     date: str = "",
     days_open: int = 0,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """Send dispute email directly without creating a dispute record first."""
+    tenant_id = bind_tenant(current_user, tenant_id)
     # Find provider to get dispute_email
     provider_result = await db.execute(
         select(Provider).where(
@@ -439,8 +460,10 @@ async def list_email_logs(
     provider: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """List all dispute emails sent for a tenant."""
+    tenant_id = bind_tenant(current_user, tenant_id)
     query = select(DisputeEmailLog).where(DisputeEmailLog.tenant_id == tenant_id)
     
     if provider:

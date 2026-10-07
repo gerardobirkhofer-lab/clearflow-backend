@@ -6,7 +6,10 @@ import csv
 import io
 from datetime import datetime
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_db
+from app.core.secrets import encrypt_secret
+from app.core.tenant_access import bind_tenant
 from app.models.provider_transaction import ProviderTransaction
 from app.models.provider import Provider
 from app.models_orm import Tenant
@@ -18,8 +21,10 @@ async def upload_provider_report(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
     provider_name: str = Form(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    tenant_id = bind_tenant(current_user, tenant_id)
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -61,7 +66,7 @@ async def upload_provider_report(
             amount=amount,
             transaction_date=tx_date,
             reference=reference,
-            raw_data=str(row),
+            raw_data=encrypt_secret(str(row)),
             matched=0,
         )
         transactions.append(tx)
@@ -74,13 +79,25 @@ async def upload_provider_report(
 
     await db.commit()
 
+    try:
+        from app.services.open_matching import match_open_items, record_day
+        await match_open_items(db, tenant_id)
+        await record_day(db, tenant_id)
+    except Exception:
+        pass
+
     return {
         "message": f"Successfully processed {len(transactions)} {provider_name} transactions",
         "count": len(transactions)
     }
 
 @router.get("/")
-async def list_provider_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_provider_transactions(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     result = await db.execute(
         select(ProviderTransaction)
         .where(ProviderTransaction.tenant_id == tenant_id)
@@ -162,7 +179,12 @@ def _parse_date(val):
 
 
 @router.get("/list")
-async def list_providers(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_providers(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = bind_tenant(current_user, tenant_id)
     """List all providers configured for a tenant."""
     result = await db.execute(
         select(Provider).where(Provider.tenant_id == tenant_id)
@@ -195,8 +217,10 @@ async def update_provider(
     fee_fixed: float = None,
     monthly_fee: float = None,
     db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """Update provider settings (dispute email, fees, etc.)."""
+    tenant_id = bind_tenant(current_user, tenant_id)
     result = await db.execute(
         select(Provider).where(
             Provider.id == provider_id,

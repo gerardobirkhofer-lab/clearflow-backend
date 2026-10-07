@@ -13,6 +13,7 @@ class BankTransaction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(UUID, nullable=False, index=True)
+    site_id = Column(UUID, nullable=True, index=True)
     user_id = Column(Integer, nullable=True)
     filename = Column(String(255))
     bank_name = Column(String(100), nullable=True)

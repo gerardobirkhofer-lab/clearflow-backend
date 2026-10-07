@@ -3,6 +3,7 @@ FastAPI application entry point.
 Includes all routers, middleware, exception handlers, and app factory.
 """
 from __future__ import annotations
+import asyncio
 import os
 
 import uuid
@@ -19,14 +20,22 @@ import structlog
 from .core.config import get_settings
 from .core.database import shared_engine, init_db
 from .core.redis import get_redis
+from .core.secrets import assert_production_secrets
 from .api.v1 import (
+    account,
     auth,
+    companies,
+    contracts,
     tenants,
     institutions,
     collections,
     bank_statements,
     providers,
     disputes,
+    expenses,
+    forecast_setup,
+    card_operations,
+    panel,
     tpv_reports,
     fee_structures,
     reconciliation,
@@ -45,6 +54,7 @@ logger = structlog.get_logger()
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan events: startup and shutdown."""
     # Startup
+    assert_production_secrets()
     settings = get_settings()
     logger.info("app_starting", environment=settings.ENVIRONMENT)
 
@@ -63,9 +73,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:
         logger.warning("redis_unavailable", error=str(e))
 
+    stop_watch = asyncio.Event()
+    watch_task = None
+    if os.getenv("CLEARFLOW_WATCH") == "1":
+        from .services.open_matching import watch_loop
+        watch_task = asyncio.create_task(watch_loop(stop_watch))
+        logger.info("reconciliation_watch_started", seconds=os.getenv("CLEARFLOW_WATCH_SECONDS", "900"))
+
     yield
 
     # Shutdown
+    stop_watch.set()
+    if watch_task is not None:
+        watch_task.cancel()
     logger.info("app_shutting_down")
     await shared_engine.dispose()
 
@@ -83,16 +103,17 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     # CORS
-    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
-    allow_origins = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://clearflow-demo.vercel.app",
-        "https://clearflow-frontend-rust.vercel.app",
-        "https://clearflow-frontend-vbzt.onrender.com",
-    ]
-    if frontend_url and frontend_url not in allow_origins:
-        allow_origins.append(frontend_url)
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+    if os.getenv("ENVIRONMENT", "development") == "production":
+        allow_origins = [frontend_url] if frontend_url else []
+    else:
+        allow_origins = [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+        ]
+        if frontend_url and frontend_url not in allow_origins:
+            allow_origins.append(frontend_url)
 
     app.add_middleware(
         CORSMiddleware,
@@ -142,12 +163,19 @@ def create_app() -> FastAPI:
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+    app.include_router(account.router, prefix="/api/v1/account", tags=["account"])
+    app.include_router(companies.router, prefix="/api/v1/companies", tags=["companies"])
+    app.include_router(contracts.router, prefix="/api/v1/companies", tags=["contracts"])
     app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
     app.include_router(bank_statements.router, prefix="/api/v1/bank-statements", tags=["bank-statements"])
     app.include_router(providers.router, prefix="/api/v1/providers", tags=["providers"])
     app.include_router(disputes.router, prefix="/api/v1/disputes", tags=["disputes"])
+    app.include_router(expenses.router, prefix="/api/v1/expenses", tags=["expenses"])
+    app.include_router(panel.router, prefix="/api/v1", tags=["panel"])
+    app.include_router(forecast_setup.router, prefix="/api/v1", tags=["forecast"])
+    app.include_router(card_operations.router, prefix="/api/v1", tags=["card-operations"])
     app.include_router(tpv_reports.router, prefix="/api/v1", tags=["tpv-reports"])
     app.include_router(fee_structures.router, prefix="/api/v1", tags=["fee-structures"])
     app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["reconciliation"])

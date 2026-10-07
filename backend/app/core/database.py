@@ -54,7 +54,7 @@ SharedSessionLocal = async_sessionmaker(
 Base = declarative_base()
 
 # Import legacy models so they register in Base.metadata
-from app.models import bank_account, bank_transaction, dispute, dispute_email_log, expected_collection, provider, provider_connection, provider_transaction, user, local_auth_user
+from app.models import account_profile, auth_attempt, bank_account, bank_account_site, bank_transaction, card_operation, company_membership, dispute, dispute_email_log, expected_collection, expense, local_auth_user, product, provider, provider_connection, provider_transaction, reconciliation_day, sale_month, security_event, site, user
 
 
 # ── Tenant-aware DB Manager ───────────────────────────────────────────────────
@@ -160,6 +160,43 @@ async def get_shared_db() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+async def _encrypt_plain_account_numbers() -> None:
+    """Encrypt account numbers saved before encryption was turned on."""
+    from app.core.secrets import encrypt_secret
+    from app.models.bank_account import BankAccount
+
+    async with SharedSessionLocal() as session:
+        rows = await session.execute(select(BankAccount))
+        changed = False
+        for account in rows.scalars().all():
+            for field in ("iban", "account_number"):
+                value = getattr(account, field)
+                if value and not str(value).startswith("enc:v1:"):
+                    setattr(account, field, encrypt_secret(value))
+                    changed = True
+        if changed:
+            await session.commit()
+
+
+async def _encrypt_plain_statement_rows() -> None:
+    """Encrypt original upload rows saved before this protection."""
+    from app.core.secrets import encrypt_secret
+    from app.models.bank_transaction import BankTransaction
+    from app.models.provider_transaction import ProviderTransaction
+
+    async with SharedSessionLocal() as session:
+        changed = False
+        for model in (BankTransaction, ProviderTransaction):
+            rows = await session.execute(
+                select(model).where(model.raw_data.isnot(None), ~model.raw_data.startswith("enc:v1:"))
+            )
+            for row in rows.scalars().all():
+                row.raw_data = encrypt_secret(str(row.raw_data))
+                changed = True
+        if changed:
+            await session.commit()
+
+
 async def init_db() -> None:
     """Create all tables in the shared (meta) database on startup.
     Combines legacy and new ORM tables, skipping duplicates.
@@ -200,10 +237,31 @@ async def init_db() -> None:
                 $$;
                 """
             ))
+            await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS sources TEXT"))
+            await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS pending INTEGER DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS account_country VARCHAR(8)"))
+            await conn.execute(text("ALTER TABLE bank_accounts ADD COLUMN IF NOT EXISTS account_checked INTEGER"))
+            await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN iban TYPE TEXT"))
+            await conn.execute(text("ALTER TABLE bank_accounts ALTER COLUMN account_number TYPE TEXT"))
+            await conn.execute(text("ALTER TABLE sites ADD COLUMN IF NOT EXISTS location VARCHAR(80)"))
+            await conn.execute(text("ALTER TABLE providers ADD COLUMN IF NOT EXISTS contract_filename VARCHAR(255)"))
+            await conn.execute(text("ALTER TABLE providers ADD COLUMN IF NOT EXISTS contract_body TEXT"))
+            await conn.execute(text("ALTER TABLE providers ADD COLUMN IF NOT EXISTS terms_confirmed INTEGER DEFAULT 0"))
+            await conn.execute(text("ALTER TABLE providers ALTER COLUMN credit_delay_days DROP NOT NULL"))
+            await conn.execute(text("ALTER TABLE sites ADD COLUMN IF NOT EXISTS active INTEGER DEFAULT 1"))
+            await conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS due_day INTEGER"))
+            await conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS due_on DATE"))
+            await conn.execute(text("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS site_id UUID"))
+            await conn.execute(text("ALTER TABLE provider_transactions ADD COLUMN IF NOT EXISTS site_id UUID"))
+            await conn.execute(text("ALTER TABLE bank_transactions ADD COLUMN IF NOT EXISTS site_id UUID"))
+            await conn.execute(text("ALTER TABLE reconciliation_days ADD COLUMN IF NOT EXISTS place_open TEXT"))
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)
         logger.warning(f"DB init warning (tables likely exist): {e}")
+
+    await _encrypt_plain_account_numbers()
+    await _encrypt_plain_statement_rows()
 
     # Ensure default tenant exists (required for demo user)
     async with SharedSessionLocal() as session:

@@ -86,22 +86,22 @@ def test_ana_does_not_see_luis_money(client: TestClient):
 
     ana_register = client.post(
         "/api/v1/auth/register",
-        json={"email": ana_email, "password": "ana-pass", "full_name": "Ana"},
+        json={"email": ana_email, "password": "ana-password", "full_name": "Ana"},
     )
     luis_register = client.post(
         "/api/v1/auth/register",
-        json={"email": luis_email, "password": "luis-pass", "full_name": "Luis"},
+        json={"email": luis_email, "password": "luis-password", "full_name": "Luis"},
     )
     assert ana_register.status_code == 201
     assert luis_register.status_code == 201
 
     ana_login = client.post(
         "/api/v1/auth/login",
-        json={"email": ana_email, "password": "ana-pass"},
+        json={"email": ana_email, "password": "ana-password"},
     )
     luis_login = client.post(
         "/api/v1/auth/login",
-        json={"email": luis_email, "password": "luis-pass"},
+        json={"email": luis_email, "password": "luis-password"},
     )
     assert ana_login.status_code == 200
     assert luis_login.status_code == 200
@@ -171,13 +171,89 @@ def test_login_creates_tenant_for_account_without_one(client: TestClient):
                 INSERT INTO cf_local_users (email, password_hash, name, role, is_active)
                 VALUES (%s, %s, 'Legacy', 'self_owner', 1)
                 """,
-                (email, _hash_password("legacy-pass")),
+                (email, _hash_password("legacy-password")),
             )
         conn.commit()
 
-    first = client.post("/api/v1/auth/login", json={"email": email, "password": "legacy-pass"})
-    second = client.post("/api/v1/auth/login", json={"email": email, "password": "legacy-pass"})
+    first = client.post("/api/v1/auth/login", json={"email": email, "password": "legacy-password"})
+    second = client.post("/api/v1/auth/login", json={"email": email, "password": "legacy-password"})
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["user"]["tenant_id"]
     assert second.json()["user"]["tenant_id"] == first.json()["user"]["tenant_id"]
+
+
+def test_accounts_cannot_see_or_write_each_other(client: TestClient):
+    suffix = uuid.uuid4().hex[:8]
+    ana = client.post(
+        "/api/v1/auth/register",
+        json={"email": f"ana-iso-{suffix}@example.com", "password": "ana-password", "full_name": "Ana"},
+    )
+    luis = client.post(
+        "/api/v1/auth/register",
+        json={"email": f"luis-iso-{suffix}@example.com", "password": "luis-password", "full_name": "Luis"},
+    )
+    assert ana.status_code == 201
+    assert luis.status_code == 201
+    ana_body = ana.json()
+    luis_body = luis.json()
+    ana_headers = {"Authorization": f"Bearer {ana_body['token']}"}
+    luis_tenant = luis_body["user"]["tenant_id"]
+
+    listing = client.get("/api/v1/tenants/", headers=ana_headers)
+    assert listing.status_code == 200
+    ids = [item["id"] for item in listing.json()["items"]]
+    assert ids == [ana_body["user"]["tenant_id"]]
+    assert "database_url" not in listing.json()["items"][0]
+
+    blocked = client.put(
+        f"/api/v1/tenants/{luis_tenant}",
+        json={"name": "Taken"},
+        headers=ana_headers,
+    )
+    assert blocked.status_code == 403
+
+    upload = client.post(
+        "/api/v1/bank-statements/upload",
+        headers=ana_headers,
+        data={"tenant_id": luis_tenant},
+        files={"file": ("mov.csv", "fecha,concepto,importe\n01/01/2026,Nomina,10\n", "text/csv")},
+    )
+    assert upload.status_code == 403
+
+    stripe_status = client.get(f"/api/v1/stripe/status/{luis_tenant}", headers=ana_headers)
+    assert stripe_status.status_code == 403
+
+    unsigned = client.post("/api/v1/stripe/webhook", json={"type": "checkout.session.completed"})
+    assert unsigned.status_code == 400
+
+    short = client.post(
+        "/api/v1/auth/register",
+        json={"email": f"short-{suffix}@example.com", "password": "short", "full_name": "Short"},
+    )
+    assert short.status_code == 422
+
+    saved = client.put(
+        "/api/v1/account/profile",
+        json={"payload": {"societies": [{"name": "Cafe Norte"}]}, "onboarding_complete": True},
+        headers=ana_headers,
+    )
+    assert saved.status_code == 200
+    loaded = client.get("/api/v1/account/profile", headers=ana_headers)
+    assert loaded.status_code == 200
+    assert loaded.json()["payload"]["societies"][0]["name"] == "Cafe Norte"
+    assert loaded.json()["onboarding_complete"] is True
+
+    from app.api.v1.auth import _reset_token
+
+    token = _reset_token(ana_body["user"]["id"], ana_body["user"]["email"])
+    reset = client.post(
+        "/api/v1/auth/reset-password",
+        json={"token": token, "password": "ana-password-2"},
+    )
+    assert reset.status_code == 200
+    relogin = client.post(
+        "/api/v1/auth/login",
+        json={"email": ana_body["user"]["email"], "password": "ana-password-2"},
+    )
+    assert relogin.status_code == 200
