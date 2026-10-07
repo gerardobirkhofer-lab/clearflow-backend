@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import delete, func, select
@@ -21,6 +22,7 @@ from app.models.bank_transaction import BankTransaction
 from app.models.company_membership import CompanyMembership
 from app.models.local_auth_user import LocalAuthUser
 from app.models.security_event import SecurityEvent
+from app.models.provider_transaction import ProviderTransaction
 from app.models.site import Site
 from app.models_orm import Tenant, TenantTier
 
@@ -49,7 +51,13 @@ def _place_key(name: str, location: str) -> str:
 
 
 def _site_out(site: Site) -> dict:
-    return {"id": _as_uuid(site.id), "name": site.name, "location": site.location or "", "kind": site.kind}
+    return {
+        "id": _as_uuid(site.id),
+        "name": site.name,
+        "location": site.location or "",
+        "kind": site.kind,
+        "active": bool(site.active if site.active is not None else 1),
+    }
 
 
 def _company_out(tenant: Tenant, role: str, sites: list[Site]) -> dict:
@@ -575,6 +583,92 @@ async def add_site(
     await db.commit()
     await db.refresh(site)
     return _site_out(site)
+
+
+@router.patch("/{tenant_id}/sites/{site_id}")
+async def update_site(
+    tenant_id: uuid.UUID,
+    site_id: uuid.UUID,
+    data: dict,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Rename a place, or set it aside when the owner sells it."""
+    tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
+    found = await db.execute(select(Site).where(Site.id == site_id, Site.tenant_id == tenant_id))
+    site = found.scalar_one_or_none()
+    if site is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Site name is required")
+        site.name = name[:255]
+    if "active" in data:
+        site.active = 1 if data.get("active") else 0
+    await db.commit()
+    await db.refresh(site)
+    return _site_out(site)
+
+
+@router.post("/{tenant_id}/sites/{site_id}/sales", status_code=status.HTTP_201_CREATED)
+async def add_sale(
+    tenant_id: uuid.UUID,
+    site_id: uuid.UUID,
+    data: dict,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """A sale sent by the place's own system. It stays on that place."""
+    tenant_id = bind_tenant(current_user, tenant_id)
+    require_owner(current_user, tenant_id)
+    found = await db.execute(select(Site).where(Site.id == site_id, Site.tenant_id == tenant_id, Site.active == 1))
+    site = found.scalar_one_or_none()
+    if site is None:
+        raise HTTPException(status_code=404, detail="Site not found")
+    provider = (data.get("provider") or data.get("channel") or "").strip()
+    if not provider:
+        raise HTTPException(status_code=422, detail="Dime de dónde es la venta")
+    raw_amount = data.get("amount")
+    try:
+        if isinstance(raw_amount, str):
+            text = raw_amount.strip().replace(" ", "").replace("€", "")
+            if "," in text and "." in text:
+                text = text.replace(".", "").replace(",", ".")
+            elif "," in text:
+                text = text.replace(",", ".")
+            amount = float(text)
+        else:
+            amount = float(raw_amount)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="El importe de la venta no se puede leer")
+    if amount <= 0:
+        raise HTTPException(status_code=422, detail="El importe de la venta no se puede leer")
+    sold_on = data.get("sold_on") or data.get("date")
+    try:
+        when = datetime.fromisoformat(str(sold_on)) if sold_on else datetime.now(timezone.utc)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="La fecha de la venta no se puede leer")
+    row = ProviderTransaction(
+        tenant_id=tenant_id,
+        site_id=site.id,
+        provider_name=provider[:100],
+        concept=(data.get("concept") or provider)[:500],
+        amount=round(amount, 2),
+        transaction_date=when,
+        matched=0,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": row.id,
+        "site_id": str(site.id),
+        "provider": row.provider_name,
+        "amount": row.amount,
+        "sold_on": when.date().isoformat(),
+    }
 
 
 @router.post("/{tenant_id}/members", status_code=status.HTTP_201_CREATED)

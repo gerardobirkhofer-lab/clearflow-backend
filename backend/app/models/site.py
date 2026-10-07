@@ -1,7 +1,7 @@
 """A place that belongs to one company: a restaurant, bar, beach bar, or apartment book."""
 import uuid
 
-from sqlalchemy import Column, String, DateTime
+from sqlalchemy import Column, DateTime, Integer, String
 from sqlalchemy.sql import func
 
 from app.core.database import Base
@@ -16,4 +16,5 @@ class Site(Base):
     name = Column(String(255), nullable=False)
     location = Column(String(80), nullable=True)
     kind = Column(String(32), nullable=False)
+    active = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

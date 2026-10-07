@@ -13,6 +13,7 @@ class ProviderTransaction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(UUID, nullable=False, index=True)
+    site_id = Column(UUID, nullable=True, index=True)
     provider_name = Column(String(100), nullable=False, index=True)  # stripe, tpv, paypal, etc.
     filename = Column(String(255))
     concept = Column(Text)

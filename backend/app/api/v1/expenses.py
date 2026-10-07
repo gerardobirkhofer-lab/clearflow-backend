@@ -36,7 +36,41 @@ def _amount(raw) -> float:
     return round(value, 2)
 
 
-def _clean(payload: dict) -> tuple[str, str, float]:
+def _due(payload: dict) -> tuple[int | None, object]:
+    from datetime import date
+
+    due_day = payload.get("due_day")
+    if due_day in (None, ""):
+        day = None
+    else:
+        try:
+            day = int(due_day)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="El día de pago tiene que ser un número del 1 al 31.")
+        if day < 1 or day > 31:
+            raise HTTPException(status_code=422, detail="El día de pago tiene que ser un número del 1 al 31.")
+    raw = payload.get("due_on")
+    if raw in (None, ""):
+        return day, None
+    try:
+        return day, date.fromisoformat(str(raw)[:10])
+    except ValueError:
+        raise HTTPException(status_code=422, detail="La fecha de esa factura no se puede leer.")
+
+
+def _site(payload: dict):
+    import uuid as uuid_lib
+
+    raw = payload.get("site_id")
+    if raw in (None, ""):
+        return None
+    try:
+        return uuid_lib.UUID(str(raw))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Ese local no está en esta cuenta.")
+
+
+def _clean(payload: dict) -> tuple[str, str, float, int | None, object, object]:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Elige un tipo de gasto.")
     kind = str(payload.get("kind") or "").strip()
@@ -47,7 +81,8 @@ def _clean(payload: dict) -> tuple[str, str, float]:
         concept = KINDS[kind]
     if len(concept) > 80:
         raise HTTPException(status_code=422, detail="El concepto es demasiado largo.")
-    return kind, concept, _amount(payload.get("amount"))
+    due_day, due_on = _due(payload)
+    return kind, concept, _amount(payload.get("amount")), due_day, due_on, _site(payload)
 
 
 def _out(row: Expense) -> dict:
@@ -57,6 +92,9 @@ def _out(row: Expense) -> dict:
         "kind_label": KINDS.get(row.kind, row.kind),
         "concept": row.concept,
         "amount": round(float(row.amount or 0), 2),
+        "due_day": row.due_day,
+        "due_on": row.due_on.isoformat() if row.due_on else None,
+        "site_id": str(row.site_id) if row.site_id else None,
     }
 
 
@@ -81,8 +119,16 @@ async def create_expense(
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = bind_tenant(current_user, tenant_id)
-    kind, concept, amount = _clean(payload)
-    row = Expense(tenant_id=tenant_id, kind=kind, concept=concept, amount=amount)
+    kind, concept, amount, due_day, due_on, site_id = _clean(payload)
+    row = Expense(
+        tenant_id=tenant_id,
+        kind=kind,
+        concept=concept,
+        amount=amount,
+        due_day=due_day,
+        due_on=due_on,
+        site_id=site_id,
+    )
     db.add(row)
     await db.commit()
     await db.refresh(row)
