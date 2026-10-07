@@ -84,12 +84,22 @@ def test_sales_stay_on_their_place_and_a_bill_lands_on_its_day():
         caja = client.get("/api/v1/caja", headers=headers)
         assert caja.status_code == 200, caja.text
         local = next(item for item in caja.json()["places"] if item["name"] == "Local 1")
-        today_row = local["days"][0]
+        assert local["days"][0]["date"].endswith("-01")
+        assert len(local["days"]) >= 28
+        today_row = next(row for row in local["days"] if row["is_today"])
         assert today_row["date"] == today.isoformat()
         assert today_row["outflows"] == 200
         assert today_row["bills"][0]["concept"] == "Pescado"
         other = next(item for item in caja.json()["places"] if item["name"] == "Local 2")
         assert other["days"][0]["outflows"] == 0
+
+        later = client.post(
+            "/api/v1/expenses",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+            json={"kind": "other", "concept": "Limpieza", "amount": "500", "due_day": 28, "site_id": first},
+        )
+        assert later.status_code == 200, later.text
 
         sold = (today - timedelta(days=0)).isoformat()
         landed = client.post(
@@ -100,7 +110,13 @@ def test_sales_stay_on_their_place_and_a_bill_lands_on_its_day():
         assert landed.status_code == 201, landed.text
         again = client.get("/api/v1/caja", headers=headers)
         second_place = next(item for item in again.json()["places"] if item["name"] == "Local 2")
-        assert second_place["days"][0]["inflows"] == 45
+        second_today = next(row for row in second_place["days"] if row["is_today"])
+        assert second_today["inflows"] == 45
+        local_again = next(item for item in again.json()["places"] if item["name"] == "Local 1")
+        day_28 = next(row for row in local_again["days"] if row["date"].endswith("-28"))
+        assert any(bill["concept"] == "Limpieza" and bill["amount"] == 500 for bill in day_28["bills"])
+        if today.day <= 28:
+            assert any(item["date"].endswith("-28") for item in local_again["upcoming"])
 
         closed = client.patch(
             f"/api/v1/companies/{tenant_id}/sites/{second}",
@@ -113,3 +129,63 @@ def test_sales_stay_on_their_place_and_a_bill_lands_on_its_day():
         names = [item["name"] for item in after.json()["places"]]
         assert "Local 2" not in names
         assert "Local 1" in names
+
+
+def test_horizon_shows_profit_for_twelve_months():
+    today = madrid_today()
+    with TestClient(app) as client:
+        tenant_id, headers = _owner(client)
+        site = _site(client, tenant_id, headers, "Local")
+        saved = client.post(
+            "/api/v1/sale-months",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+            json={"site_id": site, "year": today.year - 1, "month": today.month, "amount": "1.000"},
+        )
+        assert saved.status_code == 200, saved.text
+        product = client.post(
+            "/api/v1/products",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+            json={"site_id": site, "name": "Ración", "sale_price": "10", "cost": "4"},
+        )
+        assert product.status_code == 200, product.text
+        contract = client.post(
+            f"/api/v1/companies/{tenant_id}/contracts",
+            headers=headers,
+            data={"provider_name": "Stripe", "fee_percent": "10", "payout_days": "2"},
+        )
+        assert contract.status_code == 200, contract.text
+        bill = client.post(
+            "/api/v1/expenses",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+            json={"kind": "salary", "concept": "Nómina", "amount": "100", "due_day": 5, "site_id": site},
+        )
+        assert bill.status_code == 200, bill.text
+
+        horizon = client.get("/api/v1/horizonte", headers=headers)
+        assert horizon.status_code == 200, horizon.text
+        place = horizon.json()["places"][0]
+        assert len(place["months"]) == 12
+        current = place["months"][0]
+        assert current["base"] == 1000
+        assert current["sales"] == 1000
+        assert current["cost"] == 400
+        assert current["fees"] == 100
+        assert current["expenses"] == 100
+        assert current["earning"] == 400
+        assert current["verdict"] == "vas_bien"
+
+        adjusted = client.put(
+            "/api/v1/projection",
+            headers=headers,
+            params={"tenant_id": tenant_id},
+            json={"adjust_percent": 10},
+        )
+        assert adjusted.status_code == 200, adjusted.text
+        again = client.get("/api/v1/horizonte", headers=headers)
+        lifted = again.json()["places"][0]["months"][0]
+        assert lifted["base"] == 1000
+        assert lifted["sales"] == 1100
+        assert lifted["earning"] == 450

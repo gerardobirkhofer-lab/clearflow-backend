@@ -1,4 +1,5 @@
 """Monthly costs the client keeps, and the cash outlook that uses them."""
+import re
 import uuid
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -14,6 +15,9 @@ from app.services.cash_outlook import KINDS, build_outlook
 router = APIRouter()
 
 
+_THOUSANDS = re.compile(r"^\d{1,3}(\.\d{3})+$")
+
+
 def _amount(raw) -> float:
     if isinstance(raw, bool) or raw is None:
         raise HTTPException(status_code=422, detail="Escribe un importe aproximado.")
@@ -25,6 +29,8 @@ def _amount(raw) -> float:
             text = text.replace(".", "").replace(",", ".")
         elif "," in text:
             text = text.replace(",", ".")
+        elif _THOUSANDS.fullmatch(text):
+            text = text.replace(".", "")
         try:
             value = float(text)
         except ValueError:

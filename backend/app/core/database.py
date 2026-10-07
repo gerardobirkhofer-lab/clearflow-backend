@@ -54,7 +54,7 @@ SharedSessionLocal = async_sessionmaker(
 Base = declarative_base()
 
 # Import legacy models so they register in Base.metadata
-from app.models import account_profile, auth_attempt, bank_account, bank_account_site, bank_transaction, company_membership, dispute, dispute_email_log, expected_collection, expense, local_auth_user, provider, provider_connection, provider_transaction, reconciliation_day, security_event, site, user
+from app.models import account_profile, auth_attempt, bank_account, bank_account_site, bank_transaction, company_membership, dispute, dispute_email_log, expected_collection, expense, local_auth_user, product, provider, provider_connection, provider_transaction, reconciliation_day, sale_month, security_event, site, user
 
 
 # ── Tenant-aware DB Manager ───────────────────────────────────────────────────

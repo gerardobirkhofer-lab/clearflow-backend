@@ -271,9 +271,26 @@ async def build_panel(db: AsyncSession, current_user: CurrentUser) -> dict:
     }
 
 
-async def build_caja(db: AsyncSession, current_user: CurrentUser, days: int = 7) -> dict:
+def month_days(today: date) -> list[date]:
+    """Every day of the month that contains today."""
+    start = today.replace(day=1)
+    if start.month == 12:
+        nxt = date(start.year + 1, 1, 1)
+    else:
+        nxt = date(start.year, start.month + 1, 1)
+    last = nxt - timedelta(days=1)
+    days = []
+    cursor = start
+    while cursor <= last:
+        days.append(cursor)
+        cursor += timedelta(days=1)
+    return days
+
+
+async def build_caja(db: AsyncSession, current_user: CurrentUser) -> dict:
     panel = await build_panel(db, current_user)
     today = madrid_today()
+    days = month_days(today)
     companies = (await companies_for_user(db, current_user))["items"]
     by_site = {item["site_id"]: item for item in panel["places"] if item["site_id"]}
     result = []
@@ -334,7 +351,7 @@ async def build_caja(db: AsyncSession, current_user: CurrentUser, days: int = 7)
             elif len(active_ids) == 1 and latest_balance is not None:
                 opening = _money(latest_balance)
 
-            inflows = { _day_key(today + timedelta(days=offset)): 0.0 for offset in range(days) }
+            inflows = { _day_key(day): 0.0 for day in days }
             for sale in sales:
                 if _place_for(sale.site_id, active_ids) != site_id:
                     continue
@@ -348,8 +365,8 @@ async def build_caja(db: AsyncSession, current_user: CurrentUser, days: int = 7)
 
             strip = []
             running = opening
-            for offset in range(days):
-                day = today + timedelta(days=offset)
+            first_gap = None
+            for day in days:
                 key = _day_key(day)
                 due = []
                 for expense in expenses:
@@ -361,8 +378,11 @@ async def build_caja(db: AsyncSession, current_user: CurrentUser, days: int = 7)
                 arrived = inflows[key]
                 closing = None if running is None else _money(running + arrived - outflow)
                 covers = None if closing is None else closing >= 0
+                if first_gap is None and day >= today and covers is False:
+                    first_gap = {"date": key, "bills": due, "closing": closing}
                 strip.append({
                     "date": key,
+                    "is_today": day == today,
                     "opening": running,
                     "inflows": arrived,
                     "outflows": outflow,
@@ -371,9 +391,17 @@ async def build_caja(db: AsyncSession, current_user: CurrentUser, days: int = 7)
                     "covers": covers,
                 })
                 running = closing
+            upcoming = [
+                {"date": row["date"], "bills": row["bills"]}
+                for row in strip
+                if row["date"] >= today.isoformat() and row["bills"]
+            ]
             result.append({
                 **place,
                 "opening_known": opening is not None,
+                "month": today.strftime("%Y-%m"),
+                "first_gap": first_gap,
+                "upcoming": upcoming,
                 "days": strip,
             })
     return {"checked_at": panel["checked_at"], "places": result}
