@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 from app.core.database import get_db
+from app.core.tenant import get_current_tenant
 from app.models.bank_transaction import BankTransaction
 from app.models.provider_transaction import ProviderTransaction
 
@@ -208,7 +209,10 @@ async def run_reconciliation(
 
 
 @router.get("/status")
-async def get_reconciliation_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_reconciliation_status(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
     bank_result = await db.execute(
         select(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
     )

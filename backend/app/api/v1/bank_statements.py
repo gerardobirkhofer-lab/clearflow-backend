@@ -1,12 +1,13 @@
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import case, select, func
 import csv
 import io
 from datetime import datetime
 
 from app.core.database import get_db
+from app.core.tenant import get_current_tenant
 from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
 
@@ -188,7 +189,10 @@ async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
     }
 
 @router.get("/dashboard")
-async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_dashboard(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: uuid.UUID = Depends(get_current_tenant),
+):
     from app.models.provider_transaction import ProviderTransaction
     
     # Use SQL aggregation instead of loading all transactions into memory
@@ -197,10 +201,10 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         select(
             func.count(BankTransaction.id).label("count"),
             func.sum(BankTransaction.amount).label("total"),
-            func.sum(func.case((BankTransaction.matched == 1, BankTransaction.amount), else_=0)).label("matched"),
-            func.sum(func.case((BankTransaction.matched == 0, BankTransaction.amount), else_=0)).label("pending"),
-            func.sum(func.case((BankTransaction.matched == 1, 1), else_=0)).label("matched_count"),
-            func.sum(func.case((BankTransaction.matched == 0, 1), else_=0)).label("pending_count"),
+            func.sum(case((BankTransaction.matched == 1, BankTransaction.amount), else_=0)).label("matched"),
+            func.sum(case((BankTransaction.matched == 0, BankTransaction.amount), else_=0)).label("pending"),
+            func.sum(case((BankTransaction.matched == 1, 1), else_=0)).label("matched_count"),
+            func.sum(case((BankTransaction.matched == 0, 1), else_=0)).label("pending_count"),
         ).where(BankTransaction.tenant_id == tenant_id)
     )
     bank_row = bank_agg.one()
@@ -210,8 +214,8 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         select(
             func.count(ProviderTransaction.id).label("count"),
             func.sum(ProviderTransaction.amount).label("total"),
-            func.sum(func.case((ProviderTransaction.matched == 1, ProviderTransaction.amount), else_=0)).label("matched"),
-            func.sum(func.case((ProviderTransaction.matched == 0, ProviderTransaction.amount), else_=0)).label("pending"),
+            func.sum(case((ProviderTransaction.matched == 1, ProviderTransaction.amount), else_=0)).label("matched"),
+            func.sum(case((ProviderTransaction.matched == 0, ProviderTransaction.amount), else_=0)).label("pending"),
         ).where(ProviderTransaction.tenant_id == tenant_id)
     )
     prov_row = prov_agg.one()
