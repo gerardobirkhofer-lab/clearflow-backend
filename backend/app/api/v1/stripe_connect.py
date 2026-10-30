@@ -1,20 +1,33 @@
-import uuid
+import json
+import logging
 import os
-import stripe
+import uuid
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
-from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Any
+
+import stripe
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from sqlalchemy import select
-from app.core.database import get_db
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db, get_shared_db
 from app.models.provider_connection import ProviderConnection
 from app.models.provider_transaction import ProviderTransaction
 from app.models_orm import Tenant
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 STRIPE_CLIENT_ID = os.getenv("STRIPE_CLIENT_ID", "")
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "").strip()
+DEFAULT_TENANT_ID = os.getenv(
+    "DEFAULT_TENANT_ID",
+    "22222222-2222-2222-2222-222222222222",
+)
+
+if STRIPE_SECRET_KEY:
+    stripe.api_key = STRIPE_SECRET_KEY
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -189,18 +202,20 @@ async def manual_sync(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
                 tenant_id=tenant_id,
                 provider_name="stripe",
                 amount=amount_eur,
-                currency=bt.currency.upper() if bt.currency else "EUR",
                 transaction_date=datetime.fromtimestamp(bt.created),
                 concept=concept,
                 reference=source_id,
-                matched=False,
-                extra_data={
-                    "stripe_type": bt.type,
-                    "fee": fee_eur,
-                    "net": net_eur,
-                    "status": bt.status,
-                    "description": bt.description or "",
-                }
+                matched=0,
+                raw_data=json.dumps(
+                    {
+                        "stripe_type": bt.type,
+                        "currency": (bt.currency or "eur").upper(),
+                        "fee": fee_eur,
+                        "net": net_eur,
+                        "status": bt.status,
+                        "description": bt.description or "",
+                    }
+                ),
             )
             db.add(tx)
             synced_count += 1
@@ -293,77 +308,236 @@ async def stripe_callback(code: str, state: str, db: AsyncSession = Depends(get_
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Webhooks (kept for future use)
+#  Webhooks — public endpoint (NO JWT). Stripe cannot authenticate as a user.
+#  Dashboard URL: https://<api-host>/api/v1/stripe/webhook
 # ═══════════════════════════════════════════════════════════════════════════════
 
+HANDLED_STRIPE_EVENTS = {
+    "charge.succeeded",
+    "charge.refunded",
+    "charge.failed",
+    "payment_intent.succeeded",
+    "payment_intent.payment_failed",
+    "payout.paid",
+    "payout.failed",
+    "balance.available",
+    "checkout.session.completed",
+}
+
+
+@router.get("/webhook")
+async def stripe_webhook_info() -> dict[str, Any]:
+    """Browser check before saving the endpoint in Stripe Dashboard."""
+    return {
+        "ok": True,
+        "service": "clearflow",
+        "endpoint": "/api/v1/stripe/webhook",
+        "method": "POST",
+        "signature_required": bool(STRIPE_WEBHOOK_SECRET),
+        "provider": "stripe",
+        "handled_events": sorted(HANDLED_STRIPE_EVENTS),
+    }
+
+
 @router.post("/webhook")
-async def stripe_webhook(request: Request, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
+async def stripe_webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_shared_db),
+):
+    """
+    Receive Stripe events and persist charges/payouts as provider_transactions.
+
+    Paste in Stripe Dashboard → Developers → Webhooks:
+      https://clearflow-api-production.up.railway.app/api/v1/stripe/webhook
+    Then set STRIPE_WEBHOOK_SECRET in Railway to the endpoint signing secret (whsec_...).
+    """
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature")
 
-    if STRIPE_WEBHOOK_SECRET and sig_header:
+    if STRIPE_WEBHOOK_SECRET:
         try:
-            event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+            event = stripe.Webhook.construct_event(
+                payload, sig_header or "", STRIPE_WEBHOOK_SECRET
+            )
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid payload")
         except stripe.error.SignatureVerificationError:
-            raise HTTPException(status_code=400, detail="Invalid signature")
+            logger.warning("stripe_webhook_invalid_signature")
+            raise HTTPException(status_code=401, detail="Invalid Stripe webhook signature")
     else:
-        event = await request.json()
+        logger.warning(
+            "stripe_webhook_secret_missing — accepting without verification; "
+            "set STRIPE_WEBHOOK_SECRET after creating the endpoint in Stripe"
+        )
+        try:
+            event = json.loads(payload.decode("utf-8") or "{}")
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
 
-    event_type = event.get("type")
+    # Stripe SDK returns StripeObject; normalize to dict
+    if hasattr(event, "to_dict"):
+        event = event.to_dict()
 
-    if event_type in ["payout.paid", "payout.created"]:
-        account_id = event.get("account")
-        payout_id = event.get("data", {}).get("object", {}).get("id")
-        if account_id and payout_id:
-            background_tasks.add_task(_sync_single_payout_oauth, account_id, payout_id)
+    event_type = event.get("type") or ""
+    event_id = event.get("id")
+    account_id = event.get("account")  # present for Connect events
+    obj = (event.get("data") or {}).get("object") or {}
 
-    return {"status": "received"}
+    logger.info(
+        "stripe_webhook event_id=%s type=%s account=%s",
+        event_id,
+        event_type,
+        account_id,
+    )
+
+    if event_type in HANDLED_STRIPE_EVENTS:
+        background_tasks.add_task(
+            _persist_stripe_event,
+            event_type=event_type,
+            event_id=event_id or "",
+            account_id=account_id,
+            obj=obj,
+        )
+
+    return {"status": "received", "type": event_type}
 
 
-async def _sync_single_payout_oauth(account_id: str, payout_id: str):
-    """Fetch a specific payout via OAuth and save to DB."""
-    from app.core.database import AsyncSessionLocal
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(ProviderConnection).where(
-            ProviderConnection.account_id == account_id,
-            ProviderConnection.provider_name == "stripe"
-        ))
+async def _resolve_tenant_id(db: AsyncSession, account_id: str | None) -> uuid.UUID | None:
+    """Map Stripe account → ClearFlow tenant via provider_connections; else default tenant."""
+    if account_id:
+        result = await db.execute(
+            select(ProviderConnection).where(
+                ProviderConnection.account_id == account_id,
+                ProviderConnection.provider_name == "stripe",
+            )
+        )
         conn = result.scalar_one_or_none()
-        if not conn:
+        if conn:
+            return conn.tenant_id
+
+    # Platform / direct-key mode: use default demo tenant if configured
+    try:
+        return uuid.UUID(DEFAULT_TENANT_ID)
+    except ValueError:
+        return None
+
+
+def _amount_from_stripe_object(obj: dict[str, Any]) -> float:
+    """Stripe amounts are in the smallest currency unit (cents)."""
+    amount = obj.get("amount")
+    if amount is None:
+        amount = obj.get("amount_total")
+    if amount is None:
+        amount = obj.get("amount_received")
+    try:
+        return float(amount or 0) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _concept_for_event(event_type: str, obj: dict[str, Any]) -> str:
+    ref = (obj.get("id") or "")[-12:]
+    mapping = {
+        "charge.succeeded": f"Stripe Charge {ref}",
+        "charge.refunded": f"Stripe Refund {ref}",
+        "charge.failed": f"Stripe Charge Failed {ref}",
+        "payment_intent.succeeded": f"Stripe PaymentIntent {ref}",
+        "payment_intent.payment_failed": f"Stripe PaymentIntent Failed {ref}",
+        "payout.paid": f"Stripe Payout {ref}",
+        "payout.failed": f"Stripe Payout Failed {ref}",
+        "checkout.session.completed": f"Stripe Checkout {ref}",
+        "balance.available": "Stripe Balance Available",
+    }
+    return mapping.get(event_type, f"Stripe {event_type} {ref}")
+
+
+async def _persist_stripe_event(
+    event_type: str,
+    event_id: str,
+    account_id: str | None,
+    obj: dict[str, Any],
+) -> None:
+    """Upsert a provider_transaction from a Stripe event (idempotent by reference)."""
+    from app.core.database import SharedSessionLocal
+
+    # balance.available has no single tx id worth storing as a line item
+    if event_type == "balance.available":
+        logger.info("stripe_balance_available account=%s", account_id)
+        return
+
+    reference = obj.get("id") or event_id
+    if not reference:
+        return
+
+    async with SharedSessionLocal() as db:
+        tenant_id = await _resolve_tenant_id(db, account_id)
+        if tenant_id is None:
+            logger.warning(
+                "stripe_event_no_tenant event_id=%s account=%s", event_id, account_id
+            )
             return
 
-        try:
-            stripe.api_key = STRIPE_SECRET_KEY
-            payout = stripe.payout.retrieve(payout_id, stripe_account=account_id)
-
-            existing = await db.execute(select(ProviderTransaction).where(
-                ProviderTransaction.tenant_id == conn.tenant_id,
+        existing = await db.execute(
+            select(ProviderTransaction).where(
+                ProviderTransaction.tenant_id == tenant_id,
                 ProviderTransaction.provider_name == "stripe",
-                ProviderTransaction.reference == payout_id
-            ))
-            if existing.scalar_one_or_none():
-                return
-
-            tx = ProviderTransaction(
-                tenant_id=conn.tenant_id,
-                provider_name="stripe",
-                amount=float(payout.amount) / 100,
-                currency=payout.currency.upper(),
-                transaction_date=datetime.fromtimestamp(payout.created),
-                concept=f"Stripe Payout {payout_id[-12:]}",
-                reference=payout_id,
-                matched=False,
-                extra_data={
-                    "payout_id": payout_id,
-                    "status": payout.status,
-                    "method": payout.method,
-                }
+                ProviderTransaction.reference == reference,
             )
-            db.add(tx)
-            conn.last_sync_at = datetime.utcnow()
-            await db.commit()
-        except Exception as e:
-            print(f"Stripe webhook sync error: {e}")
+        )
+        if existing.scalar_one_or_none():
+            return
+
+        created_ts = obj.get("created")
+        tx_date = (
+            datetime.fromtimestamp(created_ts)
+            if isinstance(created_ts, (int, float))
+            else datetime.utcnow()
+        )
+
+        amount = _amount_from_stripe_object(obj)
+        # Refunds / failed payouts: keep sign informative for reconciliation
+        if event_type in {"charge.refunded", "payout.failed"} and amount > 0:
+            amount = -amount
+
+        tx = ProviderTransaction(
+            tenant_id=tenant_id,
+            provider_name="stripe",
+            amount=amount,
+            transaction_date=tx_date,
+            concept=_concept_for_event(event_type, obj),
+            reference=reference,
+            matched=0,
+            raw_data=json.dumps(
+                {
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "account_id": account_id,
+                    "currency": (obj.get("currency") or "eur").upper(),
+                    "status": obj.get("status"),
+                    "description": obj.get("description") or obj.get("statement_descriptor"),
+                }
+            ),
+        )
+        db.add(tx)
+
+        # Touch connection last_sync if we know the account
+        if account_id:
+            result = await db.execute(
+                select(ProviderConnection).where(
+                    ProviderConnection.account_id == account_id,
+                    ProviderConnection.provider_name == "stripe",
+                )
+            )
+            conn = result.scalar_one_or_none()
+            if conn:
+                conn.last_sync_at = datetime.utcnow()
+
+        await db.commit()
+        logger.info(
+            "stripe_tx_saved tenant=%s reference=%s type=%s amount=%s",
+            tenant_id,
+            reference,
+            event_type,
+            amount,
+        )
