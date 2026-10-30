@@ -397,6 +397,13 @@ async def list_connections(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_
         )
     )
     conns = result.scalars().all()
+    def _public_extra(extra: dict[str, Any] | None) -> dict[str, Any]:
+        data = dict(extra or {})
+        # Never expose live user tokens in API responses
+        if data.get("user_access_token"):
+            data["user_access_token"] = "[redacted]"
+        return data
+
     return {
         "tenant_id": str(tenant_id),
         "provider": _provider_name(),
@@ -406,7 +413,7 @@ async def list_connections(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_
                 "provider": c.provider_name,
                 "status": c.status,
                 "last_sync_at": c.last_sync_at.isoformat() if c.last_sync_at else None,
-                "extra": c.extra_data or {},
+                "extra": _public_extra(c.extra_data if isinstance(c.extra_data, dict) else {}),
             }
             for c in conns
         ],

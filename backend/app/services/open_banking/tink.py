@@ -1,6 +1,7 @@
 """Tink Open Banking adapter (Transactions / AIS via Tink Link)."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -38,12 +39,37 @@ _LOCALE = {
     "EN": "en_US",
 }
 
+# Sandbox Demo Bank provider names (password flow) by market
+_DEMO_PROVIDERS = {
+    "ES": "es-demobank-password",
+    "SE": "se-demobank-password",
+    "GB": "uk-demobank-open-banking-redirect",
+    "UK": "uk-demobank-open-banking-redirect",
+    "DE": "de-demobank-password",
+    "FR": "fr-demobank-password",
+    "PT": "pt-demobank-password",
+    "NL": "nl-demobank-open-banking-redirect",
+    "IT": "it-demobank-open-banking-redirect",
+}
+
 
 def _credentials() -> tuple[str, str]:
     client_id = os.getenv("TINK_CLIENT_ID", "").strip()
     client_secret = os.getenv("TINK_CLIENT_SECRET", "").strip()
     return client_id, client_secret
 
+
+def _demo_provider_for_market(market: str) -> str:
+    return _DEMO_PROVIDERS.get(market.upper(), "es-demobank-password")
+
+
+def _resolve_provider_id(institution_id: str, market: str) -> str | None:
+    """Map ClearFlow institution ids to Tink input_provider."""
+    if not institution_id:
+        return None
+    if institution_id in {"demo", "tink-demo-bank", "demobank"}:
+        return _demo_provider_for_market(market)
+    return institution_id
 
 class TinkProvider(OpenBankingProvider):
     name = "tink"
@@ -77,9 +103,10 @@ class TinkProvider(OpenBankingProvider):
         if not isinstance(providers, list):
             providers = []
 
+        demo_id = _demo_provider_for_market(market)
         out: list[Institution] = [
             Institution(
-                id="demo",
+                id=demo_id,
                 name="Tink Demo Bank (sandbox)",
                 bic=None,
                 logo=None,
@@ -88,7 +115,21 @@ class TinkProvider(OpenBankingProvider):
                 max_access_valid_for_days=90,
             )
         ]
-        seen: set[str] = {"demo"}
+        # Keep legacy alias used in early tests
+        if demo_id != "demo":
+            out.insert(
+                0,
+                Institution(
+                    id="demo",
+                    name="Tink Demo Bank (sandbox alias)",
+                    bic=None,
+                    logo=None,
+                    countries=[market],
+                    transaction_total_days=90,
+                    max_access_valid_for_days=90,
+                ),
+            )
+        seen: set[str] = {"demo", demo_id}
         for p in providers:
             name = (p.get("name") or "").strip()
             if not name or name in seen:
@@ -142,15 +183,17 @@ class TinkProvider(OpenBankingProvider):
                 market = prefix
         locale = _LOCALE.get(market, _LOCALE.get(user_language.upper(), "es_ES"))
 
+        market_code = "GB" if market == "UK" else market
         params: dict[str, str] = {
             "client_id": client_id,
             "redirect_uri": redirect_url,
-            "market": market if market != "UK" else "GB",
+            "market": market_code,
             "locale": locale,
             "state": reference,
         }
-        if institution_id and institution_id not in {"demo", "tink-demo-bank"}:
-            params["input_provider"] = institution_id
+        provider = _resolve_provider_id(institution_id, market_code)
+        if provider:
+            params["input_provider"] = provider
 
         link = f"{LINK_BASE}/1.0/transactions/connect-accounts/?{urlencode(params)}"
         return LinkSession(
@@ -158,7 +201,12 @@ class TinkProvider(OpenBankingProvider):
             session_id=reference,
             access_valid_for_days=access_valid_for_days,
             agreement_id=None,
-            raw={"market": market, "locale": locale, "redirect_uri": redirect_url},
+            raw={
+                "market": market_code,
+                "locale": locale,
+                "redirect_uri": redirect_url,
+                "input_provider": provider,
+            },
         )
 
     async def get_link_status(self, session_id: str) -> LinkStatus:
@@ -200,10 +248,45 @@ class TinkProvider(OpenBankingProvider):
             if not access_token:
                 raise OpenBankingError("Tink did not return access_token", status_code=502)
 
+            # Credentials may still be refreshing right after Link completes
+            credentials_payload: Any = None
+            for attempt in range(4):
+                cred_resp = await client.get(
+                    f"{API_BASE}/api/v1/credentials/list",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if cred_resp.status_code < 400:
+                    credentials_payload = cred_resp.json()
+                    creds = (
+                        credentials_payload
+                        if isinstance(credentials_payload, list)
+                        else (credentials_payload or {}).get("credentials")
+                        or (credentials_payload or {}).get("items")
+                        or []
+                    )
+                    statuses = [
+                        (c.get("status") or c.get("statusPayload") or "").upper()
+                        for c in creds
+                        if isinstance(c, dict)
+                    ]
+                    if not statuses or any(s in {"UPDATED", "AUTHENTICATED", "CREATED"} for s in statuses):
+                        if attempt > 0 or any(s == "UPDATED" for s in statuses) or not statuses:
+                            break
+                    if all(s in {"UPDATING", "AUTHENTICATING"} for s in statuses if s):
+                        await asyncio.sleep(1.5)
+                        continue
+                break
+
             accounts_resp = await client.get(
                 f"{API_BASE}/data/v2/accounts",
                 headers={"Authorization": f"Bearer {access_token}"},
             )
+            if accounts_resp.status_code >= 400:
+                # Legacy fallback
+                accounts_resp = await client.get(
+                    f"{API_BASE}/api/v1/accounts/list",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
             if accounts_resp.status_code >= 400:
                 raise OpenBankingError(
                     f"Tink accounts failed: {accounts_resp.status_code}",
@@ -211,8 +294,22 @@ class TinkProvider(OpenBankingProvider):
                     payload=accounts_resp.text,
                 )
             accounts_payload = accounts_resp.json() or {}
-            accounts_list = accounts_payload.get("accounts") or []
-            account_ids = [a.get("id") for a in accounts_list if a.get("id")]
+            if isinstance(accounts_payload, list):
+                accounts_list = accounts_payload
+            else:
+                accounts_list = (
+                    accounts_payload.get("accounts")
+                    or accounts_payload.get("accountList")
+                    or []
+                )
+            account_ids = [a.get("id") for a in accounts_list if isinstance(a, dict) and a.get("id")]
+            if not account_ids:
+                logger.warning(
+                    "tink_accounts_empty state=%s accounts_body=%s credentials_body=%s",
+                    state,
+                    str(accounts_payload)[:500],
+                    str(credentials_payload)[:500] if credentials_payload is not None else None,
+                )
 
         institution_id = ""
         if state.startswith("cf:") and len(state.split(":")) >= 3:
@@ -229,7 +326,7 @@ class TinkProvider(OpenBankingProvider):
                 "token_type": token_data.get("token_type"),
                 "expires_in": token_data.get("expires_in"),
                 "scope": token_data.get("scope"),
-                "accounts_payload": accounts_payload,
+                "accounts_count": len(account_ids),
                 "token_obtained_at": datetime.now(timezone.utc).isoformat(),
             },
         )
