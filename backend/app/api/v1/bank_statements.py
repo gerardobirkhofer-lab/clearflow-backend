@@ -101,17 +101,30 @@ async def upload_statement(
     if total_count == 0:
         raise HTTPException(status_code=400, detail="No valid transactions found in the file. Check the column headers.")
     
-    # Auto-trigger reconciliation after upload (non-blocking, ignore errors)
+    # Auto-trigger reconciliation after upload — never swallow failures silently
+    reconciliation: dict | None = None
     try:
         from app.services.reconciliation_service import ReconciliationService
         service = ReconciliationService(db, tenant_id)
-        await service.run_reconciliation()
-    except Exception:
-        pass
-    
+        recon_result = await service.run_reconciliation()
+        reconciliation = {
+            "status": "ok",
+            "result": recon_result if isinstance(recon_result, dict) else {"raw": str(recon_result)},
+        }
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).exception(
+            "auto_reconciliation_failed tenant_id=%s after bank upload", tenant_id
+        )
+        reconciliation = {
+            "status": "error",
+            "detail": str(exc) or "La conciliación automática falló tras el upload",
+        }
+
     return {
         "message": f"Successfully processed {total_count} transactions",
-        "count": total_count
+        "count": total_count,
+        "reconciliation": reconciliation,
     }
 
 def _get_field(row: dict, keys: list) -> str:
@@ -177,14 +190,22 @@ def _parse_date(val):
 async def list_transactions(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_shared_db),
-    limit: int = Query(default=200, ge=1, le=1000),
+    limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
+    matched: int | None = Query(
+        default=None,
+        ge=0,
+        le=1,
+        description="Filter by match status: 0=unreconciled, 1=reconciled, omit=all",
+    ),
 ):
-    """Paginated bank movements. Default limit keeps Payment Check / pitch screens fast."""
+    """Paginated bank movements. Default limit=50 keeps Payment Check under ~1s."""
+    filters = [BankTransaction.tenant_id == tenant_id]
+    if matched is not None:
+        filters.append(BankTransaction.matched == matched)
+
     total_count = await db.scalar(
-        select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id
-        )
+        select(func.count()).select_from(BankTransaction).where(*filters)
     ) or 0
     open_banking_count = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(
@@ -194,16 +215,14 @@ async def list_transactions(
     ) or 0
     total_amount = float(
         await db.scalar(
-            select(func.coalesce(func.sum(BankTransaction.amount), 0)).where(
-                BankTransaction.tenant_id == tenant_id
-            )
+            select(func.coalesce(func.sum(BankTransaction.amount), 0)).where(*filters)
         )
         or 0
     )
 
     result = await db.execute(
         select(BankTransaction)
-        .where(BankTransaction.tenant_id == tenant_id)
+        .where(*filters)
         .order_by(BankTransaction.transaction_date.desc())
         .offset(offset)
         .limit(limit)
@@ -231,6 +250,7 @@ async def list_transactions(
         "returned_count": len(txs),
         "limit": limit,
         "offset": offset,
+        "matched_filter": matched,
         "total_amount": total_amount,
         "open_banking_count": open_banking_count,
     }
