@@ -1,26 +1,21 @@
 import uuid
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, text
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 from app.core.database import get_shared_db
+from app.core.tenant import resolve_tenant_id
 from app.models.bank_transaction import BankTransaction
 from app.models.provider_transaction import ProviderTransaction
 
 router = APIRouter()
 
 
-@router.post("/run")
-async def run_reconciliation(
-    tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_shared_db)
-):
+async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict:
     """
-    Scalable reconciliation engine.
-    Loads only lightweight tuples, indexes by amount, processes in batches,
-    and updates matches with bulk SQL.
+    Single Phase-0 matching engine — used by POST /reconciliation/run and CSV upload.
     """
     # ── Step 1: Load provider transactions as lightweight tuples ──
     # (id, amount, transaction_date, reference, concept)
@@ -204,11 +199,24 @@ async def run_reconciliation(
         "unmatched_provider_count": len(unmatched_provider),
         "total_bank": total_bank,
         "total_provider": len(prov_rows),
+        "engine": "clearflow_v1",
     }
 
 
+@router.post("/run")
+async def run_reconciliation(
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_shared_db),
+):
+    """Run the single Phase-0 reconciliation engine for the authenticated tenant."""
+    return await execute_reconciliation(db, tenant_id)
+
+
 @router.get("/status")
-async def get_reconciliation_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
+async def get_reconciliation_status(
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_shared_db),
+):
     """Lightweight counts — never load full transaction tables into memory."""
     bank_transactions = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(

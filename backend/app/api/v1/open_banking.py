@@ -26,7 +26,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
+from app.core.tenant import assert_tenant_access
 from app.models.bank_account import BankAccount
 from app.models.bank_transaction import BankTransaction
 from app.models.provider_connection import ProviderConnection
@@ -121,25 +123,28 @@ async def list_institutions(country: str = Query(default="ES", min_length=2, max
 async def create_bank_link(
     body: CreateLinkRequest,
     db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """
     Start Open Banking consent for a tenant + bank.
     Returns { link, session_id, agreement_id?, access_valid_for_days }.
     """
+    tenant_id = assert_tenant_access(body.tenant_id, current_user)
+
     if not is_configured():
         raise HTTPException(
             status_code=503,
             detail="Open Banking credentials not configured on the server",
         )
 
-    result = await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     client = get_open_banking_client()
     provider_name = client.name
-    reference = f"cf:{body.tenant_id}:{body.institution_id}"
+    reference = f"cf:{tenant_id}:{body.institution_id}"
     callback = f"{API_PUBLIC_URL}/api/v1/open-banking/callback"
 
     try:
@@ -155,7 +160,7 @@ async def create_bank_link(
     # Upsert pending connection
     existing = await db.execute(
         select(ProviderConnection).where(
-            ProviderConnection.tenant_id == body.tenant_id,
+            ProviderConnection.tenant_id == tenant_id,
             ProviderConnection.provider_name.in_(_provider_names_for_query()),
             ProviderConnection.account_id == body.institution_id,
         )
@@ -177,7 +182,7 @@ async def create_bank_link(
         conn.extra_data = {**(conn.extra_data or {}), **extra}
     else:
         conn = ProviderConnection(
-            tenant_id=body.tenant_id,
+            tenant_id=tenant_id,
             provider_name=provider_name,
             account_id=body.institution_id,
             status="pending",
@@ -392,9 +397,11 @@ async def open_banking_callback(
 async def list_open_banking_transactions(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
     limit: int = Query(default=200, ge=1, le=1000),
 ):
     """Bank movements ingested via Open Banking sync (filename=open_banking)."""
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     result = await db.execute(
         select(BankTransaction)
         .where(
@@ -426,7 +433,12 @@ async def list_open_banking_transactions(
 
 
 @router.get("/connections/{tenant_id}")
-async def list_connections(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
+async def list_connections(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     result = await db.execute(
         select(ProviderConnection).where(
             ProviderConnection.tenant_id == tenant_id,
@@ -461,9 +473,11 @@ async def list_connections(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_
 async def sync_transactions(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
     days: int = Query(default=90, ge=1, le=365),
 ):
     """Pull transactions for all connected Open Banking accounts of the tenant."""
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     if not is_configured():
         raise HTTPException(status_code=503, detail="Open Banking not configured")
 

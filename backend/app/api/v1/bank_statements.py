@@ -6,7 +6,9 @@ import csv
 import io
 from datetime import datetime
 
+from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
+from app.core.tenant import assert_tenant_access, resolve_tenant_id
 from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
 
@@ -30,8 +32,10 @@ def _tx_source(filename: str | None, bank_name: str | None = None) -> str:
 async def upload_statement(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
-    db: AsyncSession = Depends(get_shared_db)
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     # Verify tenant exists
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
@@ -101,16 +105,12 @@ async def upload_statement(
     if total_count == 0:
         raise HTTPException(status_code=400, detail="No valid transactions found in the file. Check the column headers.")
     
-    # Auto-trigger reconciliation after upload — never swallow failures silently
+    # Same engine as Payment Check "Run" (Phase 0: one reconciler)
     reconciliation: dict | None = None
     try:
-        from app.services.reconciliation_service import ReconciliationService
-        service = ReconciliationService(db, tenant_id)
-        recon_result = await service.run_reconciliation()
-        reconciliation = {
-            "status": "ok",
-            "result": recon_result if isinstance(recon_result, dict) else {"raw": str(recon_result)},
-        }
+        from app.api.v1.reconciliation import execute_reconciliation
+        recon_result = await execute_reconciliation(db, tenant_id)
+        reconciliation = {"status": "ok", "result": recon_result}
     except Exception as exc:
         import logging
         logging.getLogger(__name__).exception(
@@ -188,8 +188,8 @@ def _parse_date(val):
 
 @router.get("/")
 async def list_transactions(
-    tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_shared_db),
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     matched: int | None = Query(
@@ -256,7 +256,10 @@ async def list_transactions(
     }
 
 @router.get("/dashboard")
-async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
+async def get_dashboard(
+    db: AsyncSession = Depends(get_shared_db),
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+):
     from app.models.provider_transaction import ProviderTransaction
 
     bank_count = await db.scalar(
