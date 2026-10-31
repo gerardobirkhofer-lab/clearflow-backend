@@ -1,5 +1,5 @@
 import uuid
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 import csv
@@ -174,11 +174,39 @@ def _parse_date(val):
     return None
 
 @router.get("/")
-async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
+async def list_transactions(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+):
+    """Paginated bank movements. Default limit keeps Payment Check / pitch screens fast."""
+    total_count = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id
+        )
+    ) or 0
+    open_banking_count = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.filename == "open_banking",
+        )
+    ) or 0
+    total_amount = float(
+        await db.scalar(
+            select(func.coalesce(func.sum(BankTransaction.amount), 0)).where(
+                BankTransaction.tenant_id == tenant_id
+            )
+        )
+        or 0
+    )
+
     result = await db.execute(
         select(BankTransaction)
         .where(BankTransaction.tenant_id == tenant_id)
         .order_by(BankTransaction.transaction_date.desc())
+        .offset(offset)
+        .limit(limit)
     )
     txs = result.scalars().all()
     return {
@@ -199,9 +227,12 @@ async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
             }
             for t in txs
         ],
-        "total_count": len(txs),
-        "total_amount": sum(t.amount or 0 for t in txs),
-        "open_banking_count": sum(1 for t in txs if _tx_source(t.filename, t.bank_name) == "open_banking"),
+        "total_count": total_count,
+        "returned_count": len(txs),
+        "limit": limit,
+        "offset": offset,
+        "total_amount": total_amount,
+        "open_banking_count": open_banking_count,
     }
 
 @router.get("/dashboard")
@@ -332,12 +363,30 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_sha
         .order_by(BankTransaction.transaction_date.desc())
         .limit(100)
     )
+    matched_bank_result = await db.execute(
+        select(BankTransaction)
+        .where(BankTransaction.tenant_id == tenant_id, BankTransaction.matched == 1)
+        .order_by(BankTransaction.transaction_date.desc())
+        .limit(50)
+    )
     unmatched_provider_result = await db.execute(
         select(ProviderTransaction)
         .where(ProviderTransaction.tenant_id == tenant_id, ProviderTransaction.matched == 0)
         .order_by(ProviderTransaction.transaction_date.desc())
         .limit(50)
     )
+
+    def _bank_row(b: BankTransaction, matched: bool) -> dict:
+        return {
+            "id": b.id,
+            "concept": b.concept,
+            "amount": b.amount,
+            "date": b.transaction_date.isoformat() if b.transaction_date else None,
+            "matched": matched,
+            "type": "bank",
+            "source": _tx_source(b.filename, b.bank_name),
+            "bank_name": b.bank_name,
+        }
 
     return {
         "summary": {
@@ -360,19 +409,8 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_sha
         },
         "recent_activity": recent_bank + recent_provider,
         "discrepancies": {
-            "unmatched_bank": [
-                {
-                    "id": b.id,
-                    "concept": b.concept,
-                    "amount": b.amount,
-                    "date": b.transaction_date.isoformat() if b.transaction_date else None,
-                    "matched": False,
-                    "type": "bank",
-                    "source": _tx_source(b.filename, b.bank_name),
-                    "bank_name": b.bank_name,
-                }
-                for b in unmatched_bank_result.scalars().all()
-            ],
+            "unmatched_bank": [_bank_row(b, False) for b in unmatched_bank_result.scalars().all()],
+            "matched_bank": [_bank_row(b, True) for b in matched_bank_result.scalars().all()],
             "unmatched_provider": [
                 {
                     "id": p.id,

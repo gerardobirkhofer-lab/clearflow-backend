@@ -209,21 +209,35 @@ async def run_reconciliation(
 
 @router.get("/status")
 async def get_reconciliation_status(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
-    bank_result = await db.execute(
-        select(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
-    )
-    prov_result = await db.execute(
-        select(ProviderTransaction).where(ProviderTransaction.tenant_id == tenant_id)
-    )
-
-    bank_txs = bank_result.scalars().all()
-    prov_txs = prov_result.scalars().all()
+    """Lightweight counts — never load full transaction tables into memory."""
+    bank_transactions = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id
+        )
+    ) or 0
+    provider_transactions = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id
+        )
+    ) or 0
+    matched_bank = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.matched == 1,
+        )
+    ) or 0
+    matched_provider = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id,
+            ProviderTransaction.matched == 1,
+        )
+    ) or 0
 
     return {
-        "bank_transactions": len(bank_txs),
-        "provider_transactions": len(prov_txs),
-        "matched_bank": sum(1 for b in bank_txs if b.matched),
-        "matched_provider": sum(1 for p in prov_txs if p.matched),
-        "pending_bank": sum(1 for b in bank_txs if not b.matched),
-        "pending_provider": sum(1 for p in prov_txs if not p.matched),
+        "bank_transactions": bank_transactions,
+        "provider_transactions": provider_transactions,
+        "matched_bank": matched_bank,
+        "matched_provider": matched_provider,
+        "pending_bank": max(0, bank_transactions - matched_bank),
+        "pending_provider": max(0, provider_transactions - matched_provider),
     }

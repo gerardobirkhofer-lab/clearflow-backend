@@ -482,6 +482,7 @@ async def sync_transactions(
     date_from = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
     synced = 0
     accounts_seen = 0
+    account_errors: list[str] = []
 
     for conn in conns:
         account_ids = (conn.extra_data or {}).get("account_ids") or []
@@ -497,6 +498,7 @@ async def sync_transactions(
                 )
             except OpenBankingError as exc:
                 logger.warning("open_banking_sync_failed account=%s err=%s", account_id, exc)
+                account_errors.append(str(exc))
                 continue
 
             for tx in txs:
@@ -537,6 +539,18 @@ async def sync_transactions(
         conn.extra_data = extra
 
     await db.commit()
+
+    if accounts_seen > 0 and synced == 0 and len(account_errors) >= accounts_seen:
+        joined = "; ".join(account_errors[:3])
+        raise HTTPException(
+            status_code=401 if any("token" in e.lower() or "unauthor" in e.lower() or "401" in e for e in account_errors) else 502,
+            detail=(
+                "No se pudieron sincronizar las cuentas. "
+                "La autorización del banco probablemente caducó: volvé a conectar el banco. "
+                f"Detalle: {joined}"
+            ),
+        )
+
     return {
         "status": "synced",
         "provider": client.name,
@@ -544,4 +558,5 @@ async def sync_transactions(
         "accounts": accounts_seen,
         "synced_count": synced,
         "date_from": date_from,
+        "account_errors": account_errors[:5] if account_errors else [],
     }
