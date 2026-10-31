@@ -208,41 +208,82 @@ async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
 async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
     from app.models.provider_transaction import ProviderTransaction
 
-    bank_agg = await db.execute(
-        select(
-            func.count(BankTransaction.id).label("count"),
-            func.sum(BankTransaction.amount).label("total"),
-            func.sum(func.case((BankTransaction.matched == 1, BankTransaction.amount), else_=0)).label("matched"),
-            func.sum(func.case((BankTransaction.matched == 0, BankTransaction.amount), else_=0)).label("pending"),
-            func.sum(func.case((BankTransaction.matched == 1, 1), else_=0)).label("matched_count"),
-            func.sum(func.case((BankTransaction.matched == 0, 1), else_=0)).label("pending_count"),
-        ).where(BankTransaction.tenant_id == tenant_id)
+    bank_count = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(BankTransaction.tenant_id == tenant_id)
+    ) or 0
+    matched_count = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.matched == 1,
+        )
+    ) or 0
+    pending_count_bank = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.matched == 0,
+        )
+    ) or 0
+    total_bank = float(
+        await db.scalar(
+            select(func.coalesce(func.sum(BankTransaction.amount), 0)).where(
+                BankTransaction.tenant_id == tenant_id
+            )
+        )
+        or 0
     )
-    bank_row = bank_agg.one()
-
-    ob_count_result = await db.execute(
-        select(func.count(BankTransaction.id)).where(
+    matched_bank = float(
+        await db.scalar(
+            select(func.coalesce(func.sum(BankTransaction.amount), 0)).where(
+                BankTransaction.tenant_id == tenant_id,
+                BankTransaction.matched == 1,
+            )
+        )
+        or 0
+    )
+    pending_bank = float(
+        await db.scalar(
+            select(func.coalesce(func.sum(BankTransaction.amount), 0)).where(
+                BankTransaction.tenant_id == tenant_id,
+                BankTransaction.matched == 0,
+            )
+        )
+        or 0
+    )
+    open_banking_count = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
             BankTransaction.tenant_id == tenant_id,
             BankTransaction.filename == "open_banking",
         )
-    )
-    open_banking_count = ob_count_result.scalar() or 0
+    ) or 0
 
-    prov_agg = await db.execute(
-        select(
-            func.count(ProviderTransaction.id).label("count"),
-            func.sum(ProviderTransaction.amount).label("total"),
-            func.sum(func.case((ProviderTransaction.matched == 1, ProviderTransaction.amount), else_=0)).label("matched"),
-            func.sum(func.case((ProviderTransaction.matched == 0, ProviderTransaction.amount), else_=0)).label("pending"),
-        ).where(ProviderTransaction.tenant_id == tenant_id)
+    provider_count = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id
+        )
+    ) or 0
+    total_provider = float(
+        await db.scalar(
+            select(func.coalesce(func.sum(ProviderTransaction.amount), 0)).where(
+                ProviderTransaction.tenant_id == tenant_id
+            )
+        )
+        or 0
     )
-    prov_row = prov_agg.one()
-
-    total_bank = float(bank_row.total or 0)
-    total_provider = float(prov_row.total or 0)
-    matched_bank = float(bank_row.matched or 0)
-    pending_bank = float(bank_row.pending or 0)
-    pending_provider = float(prov_row.pending or 0)
+    pending_provider = float(
+        await db.scalar(
+            select(func.coalesce(func.sum(ProviderTransaction.amount), 0)).where(
+                ProviderTransaction.tenant_id == tenant_id,
+                ProviderTransaction.matched == 0,
+            )
+        )
+        or 0
+    )
+    matched_provider_count = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id,
+            ProviderTransaction.matched == 1,
+        )
+    ) or 0
 
     recent_bank_result = await db.execute(
         select(BankTransaction)
@@ -305,12 +346,12 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_sha
             "matched_amount": matched_bank,
             "missing_amount": abs(pending_provider) + abs(pending_bank),
             "collection_rate": (matched_bank / total_provider * 100) if total_provider else 0,
-            "bank_count": bank_row.count or 0,
-            "provider_count": prov_row.count or 0,
-            "matched_count": bank_row.matched_count or 0,
-            "pending_count": (bank_row.pending_count or 0) + (prov_row.count or 0) - (prov_row.matched or 0),
-            "bank_transactions": bank_row.count or 0,
-            "provider_transactions": prov_row.count or 0,
+            "bank_count": bank_count,
+            "provider_count": provider_count,
+            "matched_count": matched_count,
+            "pending_count": pending_count_bank + max(0, provider_count - matched_provider_count),
+            "bank_transactions": bank_count,
+            "provider_transactions": provider_count,
             "open_banking_transactions": open_banking_count,
             "matched_bank": matched_bank,
             "matched_provider": matched_bank,
