@@ -388,6 +388,43 @@ async def open_banking_callback(
     return RedirectResponse(url=f"{redirect_after}?{qs}", status_code=302)
 
 
+@router.get("/transactions/{tenant_id}")
+async def list_open_banking_transactions(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    limit: int = Query(default=200, ge=1, le=1000),
+):
+    """Bank movements ingested via Open Banking sync (filename=open_banking)."""
+    result = await db.execute(
+        select(BankTransaction)
+        .where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.filename == "open_banking",
+        )
+        .order_by(BankTransaction.transaction_date.desc())
+        .limit(limit)
+    )
+    txs = result.scalars().all()
+    return {
+        "tenant_id": str(tenant_id),
+        "total_count": len(txs),
+        "transactions": [
+            {
+                "id": t.id,
+                "concept": t.concept,
+                "amount": t.amount,
+                "date": t.transaction_date.isoformat() if t.transaction_date else None,
+                "reference": t.reference,
+                "bank_name": t.bank_name,
+                "matched": bool(t.matched),
+                "source": "open_banking",
+                "type": "bank",
+            }
+            for t in txs
+        ],
+    }
+
+
 @router.get("/connections/{tenant_id}")
 async def list_connections(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
     result = await db.execute(

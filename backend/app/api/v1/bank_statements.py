@@ -6,7 +6,7 @@ import csv
 import io
 from datetime import datetime
 
-from app.core.database import get_db
+from app.core.database import get_shared_db
 from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
 
@@ -14,11 +14,23 @@ router = APIRouter()
 
 BATCH_SIZE = 500  # Commit every N transactions to avoid memory/time issues
 
+
+def _tx_source(filename: str | None, bank_name: str | None = None) -> str:
+    """Label how the movement entered ClearFlow (Open Banking vs CSV upload)."""
+    if (filename or "").lower() in ("open_banking", "open-banking", "tink", "gocardless", "truelayer"):
+        return "open_banking"
+    if filename:
+        return "csv"
+    if bank_name:
+        return "open_banking"
+    return "unknown"
+
+
 @router.post("/upload")
 async def upload_statement(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_shared_db)
 ):
     # Verify tenant exists
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
@@ -162,7 +174,7 @@ def _parse_date(val):
     return None
 
 @router.get("/")
-async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
     result = await db.execute(
         select(BankTransaction)
         .where(BankTransaction.tenant_id == tenant_id)
@@ -176,23 +188,26 @@ async def list_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get
                 "concept": t.concept,
                 "amount": t.amount,
                 "transaction_date": t.transaction_date.isoformat() if t.transaction_date else None,
+                "date": t.transaction_date.isoformat() if t.transaction_date else None,
                 "reference": t.reference,
                 "filename": t.filename,
-                "matched": t.matched,
+                "bank_name": t.bank_name,
+                "source": _tx_source(t.filename, t.bank_name),
+                "matched": bool(t.matched),
+                "type": "bank",
                 "created_at": t.created_at.isoformat() if t.created_at else None,
             }
             for t in txs
         ],
         "total_count": len(txs),
-        "total_amount": sum(t.amount for t in txs),
+        "total_amount": sum(t.amount or 0 for t in txs),
+        "open_banking_count": sum(1 for t in txs if _tx_source(t.filename, t.bank_name) == "open_banking"),
     }
 
 @router.get("/dashboard")
-async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_shared_db)):
     from app.models.provider_transaction import ProviderTransaction
-    
-    # Use SQL aggregation instead of loading all transactions into memory
-    # Bank aggregates
+
     bank_agg = await db.execute(
         select(
             func.count(BankTransaction.id).label("count"),
@@ -204,8 +219,15 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         ).where(BankTransaction.tenant_id == tenant_id)
     )
     bank_row = bank_agg.one()
-    
-    # Provider aggregates
+
+    ob_count_result = await db.execute(
+        select(func.count(BankTransaction.id)).where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.filename == "open_banking",
+        )
+    )
+    open_banking_count = ob_count_result.scalar() or 0
+
     prov_agg = await db.execute(
         select(
             func.count(ProviderTransaction.id).label("count"),
@@ -215,25 +237,34 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         ).where(ProviderTransaction.tenant_id == tenant_id)
     )
     prov_row = prov_agg.one()
-    
+
     total_bank = float(bank_row.total or 0)
     total_provider = float(prov_row.total or 0)
     matched_bank = float(bank_row.matched or 0)
     pending_bank = float(bank_row.pending or 0)
     pending_provider = float(prov_row.pending or 0)
-    
-    # Recent activity (last 10 from each) — still need to load a small subset
+
     recent_bank_result = await db.execute(
         select(BankTransaction)
         .where(BankTransaction.tenant_id == tenant_id)
         .order_by(BankTransaction.transaction_date.desc())
-        .limit(10)
+        .limit(25)
     )
     recent_bank = [
-        {"id": b.id, "concept": b.concept, "amount": b.amount, "date": b.transaction_date.isoformat() if b.transaction_date else None, "matched": b.matched, "type": "bank"}
+        {
+            "id": b.id,
+            "concept": b.concept,
+            "amount": b.amount,
+            "date": b.transaction_date.isoformat() if b.transaction_date else None,
+            "matched": bool(b.matched),
+            "type": "bank",
+            "source": _tx_source(b.filename, b.bank_name),
+            "bank_name": b.bank_name,
+            "filename": b.filename,
+        }
         for b in recent_bank_result.scalars().all()
     ]
-    
+
     recent_provider_result = await db.execute(
         select(ProviderTransaction)
         .where(ProviderTransaction.tenant_id == tenant_id)
@@ -241,16 +272,24 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         .limit(10)
     )
     recent_provider = [
-        {"id": p.id, "concept": p.concept, "amount": p.amount, "date": p.transaction_date.isoformat() if p.transaction_date else None, "matched": p.matched, "type": "provider", "provider_name": p.provider_name}
+        {
+            "id": p.id,
+            "concept": p.concept,
+            "amount": p.amount,
+            "date": p.transaction_date.isoformat() if p.transaction_date else None,
+            "matched": bool(p.matched),
+            "type": "provider",
+            "source": "provider",
+            "provider_name": p.provider_name,
+        }
         for p in recent_provider_result.scalars().all()
     ]
-    
-    # Unmatched for discrepancies section (limit to 50 to avoid huge payloads)
+
     unmatched_bank_result = await db.execute(
         select(BankTransaction)
         .where(BankTransaction.tenant_id == tenant_id, BankTransaction.matched == 0)
         .order_by(BankTransaction.transaction_date.desc())
-        .limit(50)
+        .limit(100)
     )
     unmatched_provider_result = await db.execute(
         select(ProviderTransaction)
@@ -258,7 +297,7 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         .order_by(ProviderTransaction.transaction_date.desc())
         .limit(50)
     )
-    
+
     return {
         "summary": {
             "total_collected": total_bank,
@@ -270,9 +309,9 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
             "provider_count": prov_row.count or 0,
             "matched_count": bank_row.matched_count or 0,
             "pending_count": (bank_row.pending_count or 0) + (prov_row.count or 0) - (prov_row.matched or 0),
-            # Aliases for frontend compatibility
             "bank_transactions": bank_row.count or 0,
             "provider_transactions": prov_row.count or 0,
+            "open_banking_transactions": open_banking_count,
             "matched_bank": matched_bank,
             "matched_provider": matched_bank,
             "pending_bank": pending_bank,
@@ -281,12 +320,30 @@ async def get_dashboard(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         "recent_activity": recent_bank + recent_provider,
         "discrepancies": {
             "unmatched_bank": [
-                {"id": b.id, "concept": b.concept, "amount": b.amount, "date": b.transaction_date.isoformat() if b.transaction_date else None}
+                {
+                    "id": b.id,
+                    "concept": b.concept,
+                    "amount": b.amount,
+                    "date": b.transaction_date.isoformat() if b.transaction_date else None,
+                    "matched": False,
+                    "type": "bank",
+                    "source": _tx_source(b.filename, b.bank_name),
+                    "bank_name": b.bank_name,
+                }
                 for b in unmatched_bank_result.scalars().all()
             ],
             "unmatched_provider": [
-                {"id": p.id, "concept": p.concept, "amount": p.amount, "date": p.transaction_date.isoformat() if p.transaction_date else None, "provider_name": p.provider_name}
+                {
+                    "id": p.id,
+                    "concept": p.concept,
+                    "amount": p.amount,
+                    "date": p.transaction_date.isoformat() if p.transaction_date else None,
+                    "matched": False,
+                    "type": "provider",
+                    "source": "provider",
+                    "provider_name": p.provider_name,
+                }
                 for p in unmatched_provider_result.scalars().all()
             ],
-        }
+        },
     }
