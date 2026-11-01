@@ -20,6 +20,9 @@ class ProviderTransaction(Base):
     transaction_date = Column(DateTime, index=True)
     reference = Column(String(255), index=True)
     raw_data = Column(Text)
-    matched = Column(Integer, default=0, index=True)  # 0 = pending, 1 = matched
+    matched = Column(Integer, default=0, index=True)  # 1 = auto-confirmed (legacy-compatible)
+    match_status = Column(String(32), nullable=False, default="pending", index=True)
+    match_evidence = Column(Text, nullable=True)
+    matched_at = Column(DateTime, nullable=True)
     matched_bank_tx_id = Column(Integer, ForeignKey("bank_transactions.id"), nullable=True)
     created_at = Column(DateTime, server_default=func.now())

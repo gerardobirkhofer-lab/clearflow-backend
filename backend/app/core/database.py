@@ -196,6 +196,69 @@ async def init_db() -> None:
                     CREATE INDEX IF NOT EXISTS ix_cf_local_users_tenant_id
                       ON cf_local_users (tenant_id);
                   END IF;
+
+                  -- Trust engine: match_status + evidence (auto-confirm without client clicks)
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                  ) THEN
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                        AND column_name = 'match_status'
+                    ) THEN
+                      ALTER TABLE bank_transactions
+                        ADD COLUMN match_status VARCHAR(32) NOT NULL DEFAULT 'pending';
+                      CREATE INDEX IF NOT EXISTS ix_bank_tx_match_status
+                        ON bank_transactions (tenant_id, match_status);
+                      UPDATE bank_transactions SET match_status = 'confirmed' WHERE matched = 1;
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                        AND column_name = 'match_evidence'
+                    ) THEN
+                      ALTER TABLE bank_transactions ADD COLUMN match_evidence TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                        AND column_name = 'matched_at'
+                    ) THEN
+                      ALTER TABLE bank_transactions ADD COLUMN matched_at TIMESTAMP;
+                    END IF;
+                  END IF;
+
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                  ) THEN
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'match_status'
+                    ) THEN
+                      ALTER TABLE provider_transactions
+                        ADD COLUMN match_status VARCHAR(32) NOT NULL DEFAULT 'pending';
+                      CREATE INDEX IF NOT EXISTS ix_prov_tx_match_status
+                        ON provider_transactions (tenant_id, match_status);
+                      UPDATE provider_transactions SET match_status = 'confirmed' WHERE matched = 1;
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'match_evidence'
+                    ) THEN
+                      ALTER TABLE provider_transactions ADD COLUMN match_evidence TEXT;
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'matched_at'
+                    ) THEN
+                      ALTER TABLE provider_transactions ADD COLUMN matched_at TIMESTAMP;
+                    END IF;
+                  END IF;
                 END
                 $$;
                 """

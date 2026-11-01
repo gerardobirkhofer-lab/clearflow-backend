@@ -345,6 +345,10 @@ async def get_dashboard(
         .order_by(BankTransaction.transaction_date.desc())
         .limit(25)
     )
+    def _status_of(tx) -> str:
+        status = getattr(tx, "match_status", None) or ("confirmed" if tx.matched else "pending")
+        return status
+
     recent_bank = [
         {
             "id": b.id,
@@ -352,6 +356,8 @@ async def get_dashboard(
             "amount": b.amount,
             "date": b.transaction_date.isoformat() if b.transaction_date else None,
             "matched": bool(b.matched),
+            "match_status": _status_of(b),
+            "match_evidence": getattr(b, "match_evidence", None),
             "type": "bank",
             "source": _tx_source(b.filename, b.bank_name),
             "bank_name": b.bank_name,
@@ -373,6 +379,8 @@ async def get_dashboard(
             "amount": p.amount,
             "date": p.transaction_date.isoformat() if p.transaction_date else None,
             "matched": bool(p.matched),
+            "match_status": _status_of(p),
+            "match_evidence": getattr(p, "match_evidence", None),
             "type": "provider",
             "source": "provider",
             "provider_name": p.provider_name,
@@ -406,6 +414,8 @@ async def get_dashboard(
             "amount": b.amount,
             "date": b.transaction_date.isoformat() if b.transaction_date else None,
             "matched": matched,
+            "match_status": _status_of(b),
+            "match_evidence": getattr(b, "match_evidence", None),
             "type": "bank",
             "source": _tx_source(b.filename, b.bank_name),
             "bank_name": b.bank_name,
@@ -421,6 +431,7 @@ async def get_dashboard(
             "bank_count": bank_count,
             "provider_count": provider_count,
             "matched_count": matched_count,
+            "confirmed_count": matched_count,
             "pending_count": pending_count_bank + max(0, provider_count - matched_provider_count),
             "bank_transactions": bank_count,
             "provider_transactions": provider_count,
@@ -429,6 +440,8 @@ async def get_dashboard(
             "matched_provider": matched_bank,
             "pending_bank": pending_bank,
             "pending_provider": pending_provider,
+            "auto_confirm_only": True,
+            "engine": "clearflow_v2_trust",
         },
         "recent_activity": recent_bank + recent_provider,
         "discrepancies": {
@@ -441,6 +454,7 @@ async def get_dashboard(
                     "amount": p.amount,
                     "date": p.transaction_date.isoformat() if p.transaction_date else None,
                     "matched": False,
+                    "match_status": "pending",
                     "type": "provider",
                     "source": "provider",
                     "provider_name": p.provider_name,

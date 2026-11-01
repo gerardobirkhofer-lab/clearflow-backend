@@ -22,5 +22,9 @@ class BankTransaction(Base):
     balance = Column(Float, nullable=True)
     reference = Column(String(255), nullable=True, index=True)
     raw_data = Column(Text)
-    matched = Column(Integer, default=0, index=True)
+    matched = Column(Integer, default=0, index=True)  # 1 = auto-confirmed (legacy-compatible)
+    # pending | confirmed — system auto-confirms only with strong evidence; never client click
+    match_status = Column(String(32), nullable=False, default="pending", index=True)
+    match_evidence = Column(Text, nullable=True)  # JSON: rules, counterpart id, amounts, dates
+    matched_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
