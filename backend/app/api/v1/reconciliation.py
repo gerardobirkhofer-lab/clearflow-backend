@@ -13,7 +13,7 @@ import uuid
 from collections import defaultdict
 from datetime import datetime
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -192,6 +192,8 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
     pending_bank = 0
     used_prov_ids: set[int] = set()
     confirmations: list[dict] = []  # for bulk update
+    reject_counts: dict[str, int] = {}
+    amount_rule_counts: dict[str, int] = {}
 
     batch_size = 2000
     offset = 0
@@ -232,6 +234,7 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
                     seen_pids.add(p[0])
 
             confirmed = False
+            last_reject = "no_provider_candidate" if not candidates else None
             for p in candidates:
                 (
                     pid, p_amount, p_date, p_ref, p_conc,
@@ -244,6 +247,7 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
                     b_settlement_id=b_settle, p_settlement_id=p_settle,
                 )
                 if not ok:
+                    last_reject = evidence.get("reject_reason") or last_reject
                     continue
                 evidence["bank_tx_id"] = b_id
                 evidence["provider_tx_id"] = pid
@@ -255,10 +259,14 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
                 })
                 confirmed_count += 1
                 confirmed = True
+                rule = evidence.get("amount_rule") or "exact_amount"
+                amount_rule_counts[rule] = amount_rule_counts.get(rule, 0) + 1
                 break
 
             if not confirmed:
                 pending_bank += 1
+                if last_reject:
+                    reject_counts[last_reject] = reject_counts.get(last_reject, 0) + 1
 
         offset += batch_size
 
@@ -299,7 +307,7 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
 
     return {
         "engine": ENGINE,
-        "policy": "auto_confirm_exact_ref_and_amount_only",
+        "policy": "auto_confirm_exact_ref_and_amount_or_net_or_gross_minus_fee",
         "matched_count": confirmed_count,  # alias for FE
         "confirmed_count": confirmed_count,
         "pending_bank_count": pending_bank,
@@ -308,8 +316,11 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
         "unmatched_provider_count": pending_provider,
         "total_bank": bank_count,
         "total_provider": len(prov_rows),
+        "reject_reason_counts": reject_counts,
+        "amount_rule_counts": amount_rule_counts,
         "note": (
-            "Solo se auto-confirman pares con referencia exacta e importe exacto. "
+            "Solo se auto-confirman pares con referencia (o settlement_id) exacta "
+            "e importe exacto vs amount/net/gross−fee. "
             "El resto queda pendiente — sin pedir confirmación al cliente."
         ),
     }
@@ -366,4 +377,102 @@ async def get_reconciliation_status(
         "pending_bank": max(0, bank_transactions - confirmed_bank),
         "pending_provider": max(0, provider_transactions - confirmed_provider),
         "auto_confirm_only": True,
+    }
+
+
+@router.get("/trial-report")
+async def trial_report(
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_shared_db),
+    sample: int = Query(default=20, ge=1, le=100),
+):
+    """
+    Generic pilot report for any tenant: confirmed vs pending + sample evidence.
+    Useful after a dry-run with real or sample CSVs — not a signed close.
+    """
+    import json as _json
+
+    bank_total = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id
+        )
+    ) or 0
+    prov_total = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id
+        )
+    ) or 0
+    confirmed_bank = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            BankTransaction.tenant_id == tenant_id,
+            BankTransaction.matched == 1,
+        )
+    ) or 0
+    pending_bank = max(0, bank_total - confirmed_bank)
+
+    confirmed_rows = (
+        await db.execute(
+            select(
+                BankTransaction.id,
+                BankTransaction.concept,
+                BankTransaction.amount,
+                BankTransaction.reference,
+                BankTransaction.match_evidence,
+                BankTransaction.matched_at,
+            )
+            .where(
+                BankTransaction.tenant_id == tenant_id,
+                BankTransaction.matched == 1,
+            )
+            .order_by(BankTransaction.matched_at.desc().nullslast())
+            .limit(sample)
+        )
+    ).all()
+
+    samples = []
+    rule_hist: dict[str, int] = {}
+    for row in confirmed_rows:
+        ev_raw = row[4]
+        ev = {}
+        if ev_raw:
+            try:
+                ev = _json.loads(ev_raw) if isinstance(ev_raw, str) else dict(ev_raw)
+            except Exception:
+                ev = {"raw": str(ev_raw)[:200]}
+        for r in ev.get("rules_fired") or []:
+            rule_hist[str(r)] = rule_hist.get(str(r), 0) + 1
+        samples.append({
+            "bank_tx_id": row[0],
+            "concept": (row[1] or "")[:120],
+            "amount": row[2],
+            "reference": row[3],
+            "matched_at": row[5].isoformat() if row[5] else None,
+            "evidence": {
+                "engine": ev.get("engine"),
+                "rules_fired": ev.get("rules_fired"),
+                "amount_rule": ev.get("amount_rule"),
+                "amount_diff": ev.get("amount_diff"),
+                "day_diff": ev.get("day_diff"),
+                "provider_tx_id": ev.get("provider_tx_id"),
+                "confirmed_by": ev.get("confirmed_by"),
+            },
+        })
+
+    rate = round((confirmed_bank / bank_total) * 100, 1) if bank_total else 0.0
+    return {
+        "engine": ENGINE,
+        "pilot": True,
+        "disclaimer": (
+            "Propuesta del motor con evidencia guardada. "
+            "No es un cierre de caja firmado ni auditoría externa."
+        ),
+        "totals": {
+            "bank": bank_total,
+            "provider": prov_total,
+            "confirmed_bank": confirmed_bank,
+            "pending_bank": pending_bank,
+            "confirm_rate_pct": rate,
+        },
+        "rules_fired_histogram": rule_hist,
+        "confirmed_samples": samples,
     }

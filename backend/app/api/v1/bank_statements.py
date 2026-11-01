@@ -323,6 +323,11 @@ async def list_transactions(
                 "bank_name": t.bank_name,
                 "source": _tx_source(t.filename, t.bank_name),
                 "matched": bool(t.matched),
+                "match_status": getattr(t, "match_status", None)
+                or ("confirmed" if t.matched else "pending"),
+                "match_evidence": getattr(t, "match_evidence", None),
+                "matched_at": t.matched_at.isoformat() if getattr(t, "matched_at", None) else None,
+                "tx_kind": getattr(t, "tx_kind", None) or "bank_movement",
                 "type": "bank",
                 "created_at": t.created_at.isoformat() if t.created_at else None,
             }
