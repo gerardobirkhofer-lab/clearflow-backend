@@ -1,7 +1,7 @@
 import uuid
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Form
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import or_, select
 import csv
 import io
 from datetime import datetime
@@ -64,11 +64,28 @@ async def upload_provider_report(
         headers=headers,
     )
 
+    from app.services.contract_math import ContractTerms
+    from app.services.contractual_audit import apply_contract_recalc
+
+    # Load contract terms for this provider name
+    prov_row = await db.execute(
+        select(Provider).where(
+            Provider.tenant_id == tenant_id,
+            or_(
+                Provider.name.ilike(provider_name),
+                Provider.provider_type.ilike(provider_name),
+            ),
+        )
+    )
+    provider_cfg = prov_row.scalar_one_or_none()
+    terms = ContractTerms.from_provider(provider_cfg) if provider_cfg else None
+
     inserted = 0
     skipped_dupes = 0
     rejected_rows: list[dict] = []
     transactions: list[ProviderTransaction] = []
     seen_fps: set[str] = set()
+    gateway_deviations = 0
 
     for line_no, row in enumerate(reader, start=2):
         clean_row = {k.strip().lower() if k else "": v for k, v in row.items()}
@@ -141,6 +158,17 @@ async def upload_provider_report(
             skipped_dupes += 1
             continue
 
+        audit = apply_contract_recalc(
+            amount=amount,
+            gross_amount=fees.get("gross_amount"),
+            fee_amount=fees.get("fee_amount"),
+            net_amount=fees.get("net_amount"),
+            terms=terms,
+            sale_date=tx_date,
+        )
+        if audit["contract_audit_status"] == "gateway_deviation":
+            gateway_deviations += 1
+
         transactions.append(
             ProviderTransaction(
                 tenant_id=tenant_id,
@@ -159,6 +187,12 @@ async def upload_provider_report(
                 fee_amount=fees.get("fee_amount"),
                 net_amount=fees.get("net_amount"),
                 settlement_id=settle_id,
+                gateway_reported_net=audit["gateway_reported_net"],
+                contract_gross_basis=audit["contract_gross_basis"],
+                contract_expected_fee=audit["contract_expected_fee"],
+                contract_expected_net=audit["contract_expected_net"],
+                contract_audit_status=audit["contract_audit_status"],
+                contract_audit_json=audit["contract_audit_json"],
             )
         )
         inserted += 1
@@ -185,6 +219,14 @@ async def upload_provider_report(
         "rejected_count": len(rejected_rows),
         "tx_kind": kind,
         "channel": "provider_csv",
+        "contract_audit": {
+            "terms_loaded": terms is not None,
+            "gateway_deviations": gateway_deviations,
+            "note": (
+                "Neto esperado recalculado desde contrato; "
+                "no se confía ciegamente en el neto de la pasarela."
+            ),
+        },
     }
 
 @router.get("/")

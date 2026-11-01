@@ -16,6 +16,7 @@ class DisputeType(str, enum.Enum):
     DUPLICATE_CHARGE = "duplicate_charge"
     FEE_DISCREPANCY = "fee_discrepancy"
     LATE_SETTLEMENT = "late_settlement"
+    CONTRACTUAL_DISCREPANCY = "contractual_discrepancy"
 
 class Dispute(Base):
     __tablename__ = "disputes"

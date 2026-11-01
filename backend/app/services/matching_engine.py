@@ -1,12 +1,6 @@
 """
-ClearFlow matching engine — trust-first auto-confirm with 1:1 and 1:N.
-
-1:1  bank credit ↔ one provider row (exact ref/settlement + amount/net/gross−fee)
-1:N  bank credit ↔ many provider rows sharing settlement_id (or bank ref = settlement),
-     when sum(legs) equals bank amount within €0.01
-
-Suggested (not confirmed): same 1:N group when |sum − bank| < €1 but not exact.
-Never auto-confirm on concept/fuzzy alone.
+ClearFlow matching engine — trust-first auto-confirm with 1:1 and 1:N
++ contractual audit gate (bank must match contract-recalculated net).
 """
 from __future__ import annotations
 
@@ -14,9 +8,11 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
-ENGINE = "clearflow_v4_1n"
+from app.services.contractual_audit import contractual_block_reason
+
+ENGINE = "clearflow_v5_contract_audit"
 AUTO_CONFIRM_MAX_DAY_DIFF = 3
-SUGGEST_MAX_AMOUNT_DIFF = 1.0  # euros — suggested only, never confirmed
+SUGGEST_MAX_AMOUNT_DIFF = 1.0
 
 
 def norm_ref(ref: str | None) -> str:
@@ -36,8 +32,13 @@ def day_diff(a, b) -> int | None:
         return None
 
 
-def amount_candidates(p_amount, p_gross, p_fee, p_net) -> list[tuple[float, str]]:
+def amount_candidates(
+    p_amount, p_gross, p_fee, p_net, contract_expected_net=None
+) -> list[tuple[float, str]]:
+    """Contract expected net is preferred when present (independent recalc)."""
     out: list[tuple[float, str]] = []
+    if contract_expected_net is not None:
+        out.append((float(contract_expected_net), "contract_expected_net"))
     if p_net is not None:
         out.append((float(p_net), "provider_net"))
     if p_amount is not None:
@@ -55,12 +56,22 @@ def amount_candidates(p_amount, p_gross, p_fee, p_net) -> list[tuple[float, str]
     return uniq
 
 
-def leg_amount(p_amount, p_gross, p_fee, p_net) -> tuple[float, str]:
-    """Preferred single-leg value for summing in 1:N."""
-    cands = amount_candidates(p_amount, p_gross, p_fee, p_net)
+def leg_amount(p_amount, p_gross, p_fee, p_net, contract_expected_net=None) -> tuple[float, str]:
+    if contract_expected_net is not None:
+        return float(contract_expected_net), "contract_expected_net"
+    cands = amount_candidates(p_amount, p_gross, p_fee, p_net, contract_expected_net)
     if cands:
         return cands[0]
     return (float(p_amount or 0), "provider_amount_fallback")
+
+
+def _unpack_leg(p: tuple):
+    """Support legacy 9-tuple and extended 12-tuple with contract fields."""
+    if len(p) >= 12:
+        return p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]
+    # pad
+    base = list(p) + [None] * (12 - len(p))
+    return tuple(base[:12])
 
 
 def evaluate_auto_confirm_1to1(
@@ -68,6 +79,9 @@ def evaluate_auto_confirm_1to1(
     p_amount, p_date, p_ref, p_conc,
     p_gross=None, p_fee=None, p_net=None,
     b_settlement_id=None, p_settlement_id=None,
+    contract_expected_net=None,
+    gateway_reported_net=None,
+    contract_audit_status=None,
 ) -> tuple[bool, dict]:
     evidence: dict[str, Any] = {
         "engine": ENGINE,
@@ -78,6 +92,9 @@ def evaluate_auto_confirm_1to1(
         "provider_gross": p_gross,
         "provider_fee": p_fee,
         "provider_net": p_net,
+        "contract_expected_net": contract_expected_net,
+        "gateway_reported_net": gateway_reported_net,
+        "contract_audit_status": contract_audit_status,
         "bank_ref": b_ref,
         "provider_ref": p_ref,
         "bank_date": b_date.isoformat() if b_date else None,
@@ -104,8 +121,30 @@ def evaluate_auto_confirm_1to1(
         evidence["reject_reason"] = "missing_bank_amount"
         return False, evidence
 
+    # Contractual gate: block if bank aligns with gateway but not with contract
+    block = contractual_block_reason(
+        b_amount, contract_expected_net, gateway_reported_net, contract_audit_status
+    )
+    if block == "bank_matches_gateway_but_not_contract":
+        evidence["reject_reason"] = block
+        evidence["decision"] = "blocked_contractual_discrepancy"
+        evidence["rules_fired"].append("contractual_audit_block")
+        return False, evidence
+
     amount_ok = False
-    for cand, label in amount_candidates(p_amount, p_gross, p_fee, p_net):
+    # Prefer contract expected net when available
+    ordered = amount_candidates(
+        p_amount, p_gross, p_fee, p_net, contract_expected_net=contract_expected_net
+    )
+    # If we have a contract expected net, bank MUST match it (not merely gateway net)
+    if contract_expected_net is not None:
+        ordered = [
+            (float(contract_expected_net), "contract_expected_net"),
+        ] + [x for x in ordered if x[1] != "contract_expected_net"]
+        # Only accept contract_expected_net for auto-confirm when contract exists
+        ordered = [x for x in ordered if x[1] == "contract_expected_net"]
+
+    for cand, label in ordered:
         diff = abs(float(b_amount) - cand)
         if diff < 0.01:
             evidence["amount_diff"] = diff
@@ -114,8 +153,19 @@ def evaluate_auto_confirm_1to1(
             amount_ok = True
             break
     if not amount_ok:
-        evidence["reject_reason"] = "amount_not_exact_vs_amount_or_net_or_gross_minus_fee"
+        if contract_expected_net is not None:
+            evidence["reject_reason"] = "bank_differs_from_contract_expected_net"
+            evidence["decision"] = "blocked_contractual_discrepancy"
+            evidence["amount_diff"] = abs(
+                float(b_amount) - float(contract_expected_net)
+            )
+            evidence["rules_fired"].append("contractual_audit_block")
+        else:
+            evidence["reject_reason"] = "amount_not_exact_vs_amount_or_net_or_gross_minus_fee"
         return False, evidence
+
+    if contract_expected_net is not None:
+        evidence["rules_fired"].append("contractual_audit_pass")
 
     days = day_diff(b_date, p_date)
     evidence["day_diff"] = days
@@ -140,13 +190,8 @@ def evaluate_auto_confirm_1to1(
 
 def evaluate_auto_confirm_1ton(
     b_amount, b_date, b_ref, b_settle,
-    legs: list[tuple],  # provider row tuples as in execute_reconciliation
+    legs: list[tuple],
 ) -> tuple[str, dict]:
-    """
-    Returns (decision, evidence) where decision is:
-      confirmed | suggested | reject
-    legs: (pid, amount, date, ref, conc, gross, fee, net, settle_id)
-    """
     evidence: dict[str, Any] = {
         "engine": ENGINE,
         "match_mode": "1:N",
@@ -169,17 +214,15 @@ def evaluate_auto_confirm_1ton(
         evidence["reject_reason"] = "missing_settlement_or_ref_for_1n"
         return "reject", evidence
 
-    # All legs must share the group key via settlement_id or reference
     coherent = []
     for p in legs:
-        pid, p_amount, p_date, p_ref, p_conc, p_gross, p_fee, p_net, p_settle = p
+        pid, p_amount, p_date, p_ref, p_conc, p_gross, p_fee, p_net, p_settle, c_net, g_net, c_status = _unpack_leg(p)
         if norm_ref(p_settle) == group_key or norm_ref(p_ref) == group_key:
             coherent.append(p)
     if len(coherent) < 2:
         evidence["reject_reason"] = "legs_not_coherent_on_settlement"
         return "reject", evidence
 
-    # Date window: every leg with a date must be within window of bank
     far = 0
     for p in coherent:
         days = day_diff(b_date, p[2])
@@ -192,18 +235,31 @@ def evaluate_auto_confirm_1ton(
     evidence["rules_fired"].append("settlement_group")
     evidence["rules_fired"].append("date_within_window_all_legs")
 
+    # Prefer sum of contract_expected_net when all legs have it
+    use_contract = all(
+        _unpack_leg(p)[9] is not None for p in coherent
+    )
     total = 0.0
     rule_labels: list[str] = []
     leg_details = []
+    contractual_blocks = []
     for p in coherent:
-        pid, p_amount, p_date, p_ref, p_conc, p_gross, p_fee, p_net, p_settle = p
-        amt, label = leg_amount(p_amount, p_gross, p_fee, p_net)
+        pid, p_amount, p_date, p_ref, p_conc, p_gross, p_fee, p_net, p_settle, c_net, g_net, c_status = _unpack_leg(p)
+        if c_status == "gateway_deviation":
+            contractual_blocks.append(pid)
+        if use_contract:
+            amt, label = float(c_net), "contract_expected_net"
+        else:
+            amt, label = leg_amount(p_amount, p_gross, p_fee, p_net, c_net)
         total += amt
         rule_labels.append(label)
         leg_details.append({
             "provider_tx_id": pid,
             "leg_amount": amt,
             "leg_rule": label,
+            "contract_expected_net": c_net,
+            "gateway_reported_net": g_net,
+            "contract_audit_status": c_status,
             "reference": p_ref,
             "settlement_id": p_settle,
         })
@@ -211,27 +267,56 @@ def evaluate_auto_confirm_1ton(
     evidence["legs"] = leg_details
     evidence["legs_sum"] = round(total, 2)
     evidence["provider_tx_ids"] = [d["provider_tx_id"] for d in leg_details]
-    evidence["amount_rule"] = "sum_" + (
-        "provider_net" if all(x == "provider_net" for x in rule_labels) else "mixed_legs"
+    evidence["amount_rule"] = "sum_contract_expected_net" if use_contract else (
+        "sum_" + ("provider_net" if all(x == "provider_net" for x in rule_labels) else "mixed_legs")
     )
+    if contractual_blocks:
+        evidence["legs_with_gateway_deviation"] = contractual_blocks
+        evidence["rules_fired"].append("gateway_deviation_on_legs_using_contract_recalc")
+
     diff = abs(float(b_amount) - total)
     evidence["amount_diff"] = diff
 
+    # If bank equals sum of gateway nets but NOT contract sum → block
+    if use_contract and diff >= 0.01:
+        gateway_sum = 0.0
+        has_gw = True
+        for p in coherent:
+            _pid, _a, _d, _r, _c2, _g, _f, p_net, _s, _cnet, g_net, _st = _unpack_leg(p)
+            if g_net is None and p_net is None:
+                has_gw = False
+                break
+            gateway_sum += float(g_net if g_net is not None else p_net)
+        if has_gw and abs(float(b_amount) - gateway_sum) < 0.01:
+            evidence["reject_reason"] = "bank_matches_gateway_sum_but_not_contract_sum"
+            evidence["decision"] = "blocked_contractual_discrepancy"
+            evidence["gateway_sum"] = round(gateway_sum, 2)
+            evidence["contract_sum"] = round(total, 2)
+            return "reject", evidence
+
     if diff < 0.01:
         evidence["rules_fired"].append("exact_sum_equals_bank")
+        if use_contract:
+            evidence["rules_fired"].append("contractual_audit_pass_1n")
         evidence["decision"] = "confirmed"
         evidence["confirmed_by"] = "system_auto"
         evidence["confirmed_at"] = datetime.utcnow().isoformat() + "Z"
         return "confirmed", evidence
 
-    if diff <= SUGGEST_MAX_AMOUNT_DIFF:
+    if diff <= SUGGEST_MAX_AMOUNT_DIFF and not use_contract:
         evidence["rules_fired"].append("near_sum_suggested_not_confirmed")
         evidence["decision"] = "suggested"
         evidence["suggested_by"] = "system_auto"
         evidence["suggested_at"] = datetime.utcnow().isoformat() + "Z"
         return "suggested", evidence
 
-    evidence["reject_reason"] = "sum_not_close_to_bank"
+    if use_contract:
+        evidence["reject_reason"] = "bank_differs_from_contract_expected_sum"
+        evidence["decision"] = "blocked_contractual_discrepancy"
+        evidence["contract_sum"] = round(total, 2)
+        evidence["rules_fired"].append("contractual_audit_block_1n")
+    else:
+        evidence["reject_reason"] = "sum_not_close_to_bank"
     return "reject", evidence
 
 

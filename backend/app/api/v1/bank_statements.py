@@ -425,6 +425,18 @@ async def get_dashboard(
             ProviderTransaction.matched == 1,
         )
     ) or 0
+    contractual_disc_count = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id,
+            ProviderTransaction.match_status == "contractual_discrepancy",
+        )
+    ) or 0
+    gateway_deviation_count = await db.scalar(
+        select(func.count()).select_from(ProviderTransaction).where(
+            ProviderTransaction.tenant_id == tenant_id,
+            ProviderTransaction.contract_audit_status == "gateway_deviation",
+        )
+    ) or 0
 
     recent_bank_result = await db.execute(
         select(BankTransaction)
@@ -528,10 +540,14 @@ async def get_dashboard(
             "pending_bank": pending_bank,
             "pending_provider": pending_provider,
             "auto_confirm_only": True,
-            "engine": "clearflow_v2_trust",
+            "engine": "clearflow_v5_contract_audit",
+            "contractual_discrepancies": contractual_disc_count,
+            "gateway_fee_deviations": gateway_deviation_count,
         },
         "recent_activity": recent_bank + recent_provider,
         "discrepancies": {
+            "contractual": contractual_disc_count,
+            "gateway_deviations": gateway_deviation_count,
             "unmatched_bank": [_bank_row(b, False) for b in unmatched_bank_result.scalars().all()],
             "matched_bank": [_bank_row(b, True) for b in matched_bank_result.scalars().all()],
             "unmatched_provider": [

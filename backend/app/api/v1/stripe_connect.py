@@ -197,15 +197,38 @@ async def manual_sync(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
             amount_eur = float(bt.amount) / 100.0
             fee_eur = float(bt.fee) / 100.0
             net_eur = float(bt.net) / 100.0
+            tx_date = datetime.fromtimestamp(bt.created)
+
+            from app.services.contractual_audit import apply_contract_recalc, load_provider_terms
+
+            terms = await load_provider_terms(db, tenant_id, "stripe")
+            audit = apply_contract_recalc(
+                amount=amount_eur,
+                gross_amount=amount_eur,
+                fee_amount=fee_eur,
+                net_amount=net_eur,
+                terms=terms,
+                sale_date=tx_date,
+            )
 
             tx = ProviderTransaction(
                 tenant_id=tenant_id,
                 provider_name="stripe",
                 amount=amount_eur,
-                transaction_date=datetime.fromtimestamp(bt.created),
+                transaction_date=tx_date,
                 concept=concept,
                 reference=source_id,
                 matched=0,
+                match_status="pending",
+                gross_amount=amount_eur,
+                fee_amount=fee_eur,
+                net_amount=net_eur,
+                gateway_reported_net=audit["gateway_reported_net"],
+                contract_gross_basis=audit["contract_gross_basis"],
+                contract_expected_fee=audit["contract_expected_fee"],
+                contract_expected_net=audit["contract_expected_net"],
+                contract_audit_status=audit["contract_audit_status"],
+                contract_audit_json=audit["contract_audit_json"],
                 raw_data=json.dumps(
                     {
                         "stripe_type": bt.type,
@@ -533,6 +556,18 @@ async def _persist_stripe_event(
         if dup.scalar_one_or_none() is not None:
             return
 
+        from app.services.contractual_audit import apply_contract_recalc, load_provider_terms
+
+        terms = await load_provider_terms(db, tenant_id, "stripe")
+        audit = apply_contract_recalc(
+            amount=amount,
+            gross_amount=gross,
+            fee_amount=fee,
+            net_amount=net,
+            terms=terms,
+            sale_date=tx_date,
+        )
+
         tx = ProviderTransaction(
             tenant_id=tenant_id,
             provider_name="stripe",
@@ -562,6 +597,12 @@ async def _persist_stripe_event(
             gross_amount=gross,
             fee_amount=fee,
             net_amount=net,
+            gateway_reported_net=audit["gateway_reported_net"],
+            contract_gross_basis=audit["contract_gross_basis"],
+            contract_expected_fee=audit["contract_expected_fee"],
+            contract_expected_net=audit["contract_expected_net"],
+            contract_audit_status=audit["contract_audit_status"],
+            contract_audit_json=audit["contract_audit_json"],
         )
         db.add(tx)
 

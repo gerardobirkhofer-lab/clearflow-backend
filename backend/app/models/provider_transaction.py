@@ -31,4 +31,13 @@ class ProviderTransaction(Base):
     fee_amount = Column(Float, nullable=True)
     net_amount = Column(Float, nullable=True)
     settlement_id = Column(String(255), nullable=True, index=True)
+    # Independent contractual audit (never trust gateway net blindly)
+    gateway_reported_net = Column(Float, nullable=True)
+    contract_gross_basis = Column(Float, nullable=True)
+    contract_expected_fee = Column(Float, nullable=True)
+    contract_expected_net = Column(Float, nullable=True)
+    contract_audit_status = Column(
+        String(32), nullable=False, default="pending_audit", index=True
+    )  # ok | gateway_deviation | no_contract | pending_audit
+    contract_audit_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())

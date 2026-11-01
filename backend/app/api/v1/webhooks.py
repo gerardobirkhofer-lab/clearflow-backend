@@ -275,6 +275,18 @@ async def redsys_webhook(
                 if dup.scalar_one_or_none() is not None:
                     return PlainTextResponse("OK", status_code=200)
 
+                from app.services.contractual_audit import apply_contract_recalc, load_provider_terms
+
+                terms = await load_provider_terms(db, tenant_id, "redsys")
+                audit = apply_contract_recalc(
+                    amount=amount,
+                    gross_amount=amount,
+                    fee_amount=None,
+                    net_amount=None,
+                    terms=terms,
+                    sale_date=tx_date,
+                )
+
                 tx = ProviderTransaction(
                     tenant_id=tenant_id,
                     provider_name="redsys",
@@ -291,6 +303,13 @@ async def redsys_webhook(
                         concept=concept,
                         filename="redsys_webhook",
                     ),
+                    gross_amount=amount,
+                    gateway_reported_net=audit["gateway_reported_net"],
+                    contract_gross_basis=audit["contract_gross_basis"],
+                    contract_expected_fee=audit["contract_expected_fee"],
+                    contract_expected_net=audit["contract_expected_net"],
+                    contract_audit_status=audit["contract_audit_status"],
+                    contract_audit_json=audit["contract_audit_json"],
                 )
                 db.add(tx)
                 await db.commit()

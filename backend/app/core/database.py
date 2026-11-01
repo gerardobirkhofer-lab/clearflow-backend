@@ -343,6 +343,28 @@ async def init_db() -> None:
                       ALTER TABLE providers ADD COLUMN payout_destination VARCHAR(20) DEFAULT 'bank';
                     END IF;
                   END IF;
+
+                  -- Contractual audit columns on provider_transactions
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                  ) THEN
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'contract_expected_net'
+                    ) THEN
+                      ALTER TABLE provider_transactions ADD COLUMN gateway_reported_net DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions ADD COLUMN contract_gross_basis DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions ADD COLUMN contract_expected_fee DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions ADD COLUMN contract_expected_net DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions
+                        ADD COLUMN contract_audit_status VARCHAR(32) NOT NULL DEFAULT 'pending_audit';
+                      ALTER TABLE provider_transactions ADD COLUMN contract_audit_json TEXT;
+                      CREATE INDEX IF NOT EXISTS ix_prov_tx_contract_audit
+                        ON provider_transactions (tenant_id, contract_audit_status);
+                    END IF;
+                  END IF;
                 END
                 $$;
                 """

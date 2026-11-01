@@ -11,16 +11,20 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import SharedSessionLocal, get_shared_db
 from app.core.tenant import resolve_tenant_id
 from app.models.bank_transaction import BankTransaction
+from app.models.dispute import Dispute
+from app.models.provider import Provider
 from app.models.provider_transaction import ProviderTransaction
+from app.services.contract_math import ContractTerms
+from app.services.contractual_audit import apply_contract_recalc
 from app.services.matching_engine import (
     ENGINE,
     evaluate_auto_confirm_1to1,
@@ -57,6 +61,9 @@ async def execute_reconciliation(
     if date_to is not None:
         bank_filters.append(BankTransaction.transaction_date <= date_to)
 
+    # Ensure contract expected nets are stamped before matching
+    await _ensure_contract_audit(db, tenant_id)
+
     prov_result = await db.execute(
         select(
             ProviderTransaction.id,
@@ -68,6 +75,9 @@ async def execute_reconciliation(
             ProviderTransaction.fee_amount,
             ProviderTransaction.net_amount,
             ProviderTransaction.settlement_id,
+            ProviderTransaction.contract_expected_net,
+            ProviderTransaction.gateway_reported_net,
+            ProviderTransaction.contract_audit_status,
         ).where(
             ProviderTransaction.tenant_id == tenant_id,
             ProviderTransaction.matched == 0,
@@ -91,6 +101,7 @@ async def execute_reconciliation(
     used_prov_ids: set[int] = set()
     confirmations: list[dict] = []
     suggestions: list[dict] = []
+    contractual_blocks: list[dict] = []
     reject_counts: dict[str, int] = {}
     amount_rule_counts: dict[str, int] = {}
 
@@ -146,15 +157,28 @@ async def execute_reconciliation(
                 (
                     pid, p_amount, p_date, p_ref, p_conc,
                     p_gross, p_fee, p_net, p_settle,
+                    c_net, g_net, c_status,
                 ) = p
                 ok, evidence = evaluate_auto_confirm_1to1(
                     b_amount, b_date, b_ref, b_conc,
                     p_amount, p_date, p_ref, p_conc,
                     p_gross=p_gross, p_fee=p_fee, p_net=p_net,
                     b_settlement_id=b_settle, p_settlement_id=p_settle,
+                    contract_expected_net=c_net,
+                    gateway_reported_net=g_net,
+                    contract_audit_status=c_status,
                 )
                 if not ok:
                     last_reject = evidence.get("reject_reason") or last_reject
+                    if evidence.get("decision") == "blocked_contractual_discrepancy" or (
+                        last_reject
+                        and "contract" in str(last_reject)
+                    ):
+                        contractual_blocks.append({
+                            "bank_id": b_id,
+                            "prov_id": pid,
+                            "evidence": evidence,
+                        })
                     continue
                 evidence["bank_tx_id"] = b_id
                 evidence["provider_tx_id"] = pid
@@ -219,6 +243,14 @@ async def execute_reconciliation(
                         last_reject = None
                     else:
                         last_reject = evidence.get("reject_reason") or last_reject
+                        if evidence.get("decision") == "blocked_contractual_discrepancy" or (
+                            last_reject and "contract" in str(last_reject)
+                        ):
+                            contractual_blocks.append({
+                                "bank_id": b_id,
+                                "prov_ids": evidence.get("provider_tx_ids") or [],
+                                "evidence": evidence,
+                            })
 
             if not confirmed:
                 pending_bank += 1
@@ -294,6 +326,9 @@ async def execute_reconciliation(
                 {"pid": pid, "bid": s["bank_id"], "ev": ev_json, "ts": now},
             )
 
+    # Persist contractual discrepancies (blocked auto-confirm)
+    contractual_opened = await _open_contractual_disputes(db, tenant_id, contractual_blocks)
+
     await db.commit()
     if progress_cb:
         await progress_cb(100)
@@ -302,12 +337,14 @@ async def execute_reconciliation(
 
     return {
         "engine": ENGINE,
-        "policy": "auto_confirm_1to1_or_1n_settlement_sum",
+        "policy": "auto_confirm_only_if_bank_matches_contract_expected_net",
         "matched_count": confirmed_pairs,
         "confirmed_count": confirmed_pairs,
         "confirmed_1n_bank_count": confirmed_1n_banks,
         "confirmed_1n_leg_count": confirmed_1n_legs,
         "suggested_count": suggested_count,
+        "contractual_blocks": len(contractual_blocks),
+        "contractual_discrepancies_opened": contractual_opened,
         "pending_bank_count": pending_bank,
         "pending_provider_count": pending_provider,
         "unmatched_bank_count": pending_bank,
@@ -319,12 +356,152 @@ async def execute_reconciliation(
         "date_from": date_from.isoformat() if date_from else None,
         "date_to": date_to.isoformat() if date_to else None,
         "note": (
-            "1:1: ref/settlement + amount/net/gross−fee. "
-            "1:N: settlement group sum == bank (±€0.01). "
-            "Near sum (≤€1) → suggested (not confirmed). "
-            "Rest stays pending."
+            "Auditoría contractual: el banco debe cuadrar con el neto recalculado "
+            "desde el contrato (no con el neto declarado por la pasarela). "
+            "Desviaciones → bloqueo de auto-confirm + Discrepancia Contractual."
         ),
     }
+
+
+async def _load_terms_map(db: AsyncSession, tenant_id: uuid.UUID) -> dict[str, ContractTerms]:
+    rows = (
+        await db.execute(
+            select(Provider).where(
+                Provider.tenant_id == tenant_id,
+                Provider.is_active == 1,
+            )
+        )
+    ).scalars().all()
+    out: dict[str, ContractTerms] = {}
+    for p in rows:
+        t = ContractTerms.from_provider(p)
+        out[t.provider_name.lower()] = t
+        if p.provider_type:
+            out[p.provider_type.lower()] = t
+    return out
+
+
+async def _ensure_contract_audit(db: AsyncSession, tenant_id: uuid.UUID) -> int:
+    """Stamp contract_expected_* on provider txs missing audit."""
+    terms_map = await _load_terms_map(db, tenant_id)
+    txs = (
+        await db.execute(
+            select(ProviderTransaction).where(
+                ProviderTransaction.tenant_id == tenant_id,
+                ProviderTransaction.matched == 0,
+                or_(
+                    ProviderTransaction.contract_expected_net.is_(None),
+                    ProviderTransaction.contract_audit_status == "pending_audit",
+                ),
+            ).limit(5000)
+        )
+    ).scalars().all()
+    n = 0
+    for tx in txs:
+        pname = (tx.provider_name or "").lower()
+        terms = terms_map.get(pname)
+        if not terms:
+            for k, t in terms_map.items():
+                if k and (k in pname or pname in k):
+                    terms = t
+                    break
+        fields = apply_contract_recalc(
+            amount=tx.amount,
+            gross_amount=tx.gross_amount,
+            fee_amount=tx.fee_amount,
+            net_amount=tx.net_amount,
+            terms=terms,
+            sale_date=tx.transaction_date,
+        )
+        tx.gateway_reported_net = fields["gateway_reported_net"]
+        tx.contract_gross_basis = fields["contract_gross_basis"]
+        tx.contract_expected_fee = fields["contract_expected_fee"]
+        tx.contract_expected_net = fields["contract_expected_net"]
+        tx.contract_audit_status = fields["contract_audit_status"]
+        tx.contract_audit_json = fields["contract_audit_json"]
+        n += 1
+    if n:
+        await db.commit()
+    return n
+
+
+async def _open_contractual_disputes(
+    db: AsyncSession,
+    tenant_id: uuid.UUID,
+    blocks: list[dict],
+) -> int:
+    opened = 0
+    now = datetime.utcnow()
+    seen: set[str] = set()
+    for b in blocks:
+        ev = b.get("evidence") or {}
+        key = f"{b.get('bank_id')}:{b.get('prov_id') or tuple(b.get('prov_ids') or [])}"
+        if key in seen:
+            continue
+        seen.add(key)
+        diff = ev.get("amount_diff")
+        expected = ev.get("contract_expected_net") or ev.get("contract_sum")
+        bank_amt = ev.get("bank_amount")
+        reason = ev.get("reject_reason") or "contractual_mismatch"
+        db.add(
+            Dispute(
+                tenant_id=tenant_id,
+                transaction_id=b.get("bank_id"),
+                provider_name=str(ev.get("provider_ref") or "provider")[:50],
+                dispute_type="contractual_discrepancy",
+                status="open",
+                amount=float(expected) if expected is not None else (float(bank_amt) if bank_amt is not None else 0),
+                description=(
+                    f"[Discrepancia Contractual] {reason} "
+                    f"bank_id={b.get('bank_id')} bank_amount={bank_amt} "
+                    f"contract_expected={expected} amount_diff={diff} "
+                    f"gateway_net={ev.get('gateway_reported_net')} "
+                    f"evidence={json.dumps(ev, ensure_ascii=False)[:1200]}"
+                ),
+                expected_resolution=now + timedelta(days=14),
+            )
+        )
+        # Mark provider legs if single
+        pid = b.get("prov_id")
+        if pid:
+            await db.execute(
+                text(
+                    """
+                    UPDATE provider_transactions
+                    SET match_status = 'contractual_discrepancy',
+                        match_evidence = :ev
+                    WHERE id = :pid AND matched = 0
+                    """
+                ),
+                {"pid": pid, "ev": json.dumps(ev, ensure_ascii=False)},
+            )
+        for pid2 in b.get("prov_ids") or []:
+            await db.execute(
+                text(
+                    """
+                    UPDATE provider_transactions
+                    SET match_status = 'contractual_discrepancy',
+                        match_evidence = :ev
+                    WHERE id = :pid AND matched = 0
+                    """
+                ),
+                {"pid": pid2, "ev": json.dumps(ev, ensure_ascii=False)},
+            )
+        # Mark bank
+        if b.get("bank_id"):
+            await db.execute(
+                text(
+                    """
+                    UPDATE bank_transactions
+                    SET match_status = 'contractual_discrepancy',
+                        match_evidence = :ev
+                    WHERE id = :id AND matched = 0
+                    """
+                ),
+                {"id": b["bank_id"], "ev": json.dumps(ev, ensure_ascii=False)},
+            )
+        opened += 1
+    return opened
 
 
 def _parse_optional_date(value: str | None) -> datetime | None:
