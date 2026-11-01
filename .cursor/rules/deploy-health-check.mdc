@@ -1,0 +1,13 @@
+---
+description: Always use unrestricted network when polling ClearFlow Railway /health after deploy
+alwaysApply: true
+---
+
+# Deploy health checks
+
+When verifying that a ClearFlow backend deploy is live (`/health` on Railway):
+
+1. Always call `curl` (or `scripts/verify_deploy_health.sh`) with **unrestricted network**: Shell `required_permissions: ["all"]`.
+2. Do **not** rely on the default sandbox — it often fails with `CONNECT tunnel failed, response 403`, which is a **local agent network restriction**, not an API outage.
+3. Prefer: `bash scripts/verify_deploy_health.sh contract-audit-v1` (pass the expected `deploy` tag).
+4. Only report a deploy failure after a successful network call returns unhealthy or the wrong `deploy` tag.
