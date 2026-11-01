@@ -37,6 +37,7 @@ from .api.v1 import (
     dashboard,
     stripe_connect,
     open_banking,
+    data_portability,
 )
 
 logger = structlog.get_logger()
@@ -144,7 +145,6 @@ def create_app() -> FastAPI:
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
-    from app.api.v1 import data_portability
     app.include_router(data_portability.router, prefix="/api/v1/data", tags=["data-portability"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
