@@ -412,6 +412,16 @@ async def get_reconciliation_job(
     return job
 
 
+@router.get("/jobs")
+async def list_reconciliation_jobs(
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Recent persisted recon jobs for this tenant."""
+    items = await recon_jobs.list_jobs_for_tenant(tenant_id, limit=limit)
+    return {"jobs": items, "count": len(items)}
+
+
 @router.get("/status")
 async def get_reconciliation_status(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),

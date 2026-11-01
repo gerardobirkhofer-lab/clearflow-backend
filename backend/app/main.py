@@ -139,11 +139,13 @@ def create_app() -> FastAPI:
     # Health check
     @app.get("/health", tags=["system"])
     async def health_check():
-        return {"status": "healthy", "version": "1.0.0", "deploy": "engine-v4-1n"}
+        return {"status": "healthy", "version": "1.0.0", "deploy": "data-jobs-v1"}
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
     app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
+    from app.api.v1 import data_portability
+    app.include_router(data_portability.router, prefix="/api/v1/data", tags=["data-portability"])
     app.include_router(institutions.router, prefix="/api/v1", tags=["institutions"])
     app.include_router(collections.router, prefix="/api/v1", tags=["collections"])
     app.include_router(bank_statements.router, prefix="/api/v1/bank-statements", tags=["bank-statements"])
