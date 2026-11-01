@@ -247,22 +247,50 @@ async def redsys_webhook(
                 )
             )
             if existing.scalar_one_or_none() is None:
+                from app.services.ingest_utils import fingerprint, classify_kind
+
                 amount = float(summary.get("amount") or 0)
+                tx_date = datetime.utcnow()
                 # Non-authorized responses kept for audit with matched=0; amount may still help
                 concept = (
                     f"Redsys OK {reference}"
                     if summary.get("authorized")
                     else f"Redsys Resp {summary.get('response')} {reference}"
                 )
+                fp = fingerprint(
+                    tenant_id,
+                    channel="webhook_redsys",
+                    reference=reference,
+                    amount=amount,
+                    tx_date=tx_date,
+                    concept=concept,
+                    provider_name="redsys",
+                )
+                dup = await db.execute(
+                    select(ProviderTransaction.id).where(
+                        ProviderTransaction.tenant_id == tenant_id,
+                        ProviderTransaction.ingest_fingerprint == fp,
+                    )
+                )
+                if dup.scalar_one_or_none() is not None:
+                    return PlainTextResponse("OK", status_code=200)
+
                 tx = ProviderTransaction(
                     tenant_id=tenant_id,
                     provider_name="redsys",
                     amount=amount,
-                    transaction_date=datetime.utcnow(),
+                    transaction_date=tx_date,
                     concept=concept,
                     reference=reference,
                     matched=0,
+                    match_status="pending",
                     raw_data=json.dumps({"params": params, "summary": summary}),
+                    ingest_fingerprint=fp,
+                    tx_kind=classify_kind(
+                        channel="webhook_redsys",
+                        concept=concept,
+                        filename="redsys_webhook",
+                    ),
                 )
                 db.add(tx)
                 await db.commit()

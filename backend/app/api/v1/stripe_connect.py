@@ -488,6 +488,8 @@ async def _persist_stripe_event(
         if existing.scalar_one_or_none():
             return
 
+        from app.services.ingest_utils import fingerprint, classify_kind
+
         created_ts = obj.get("created")
         tx_date = (
             datetime.fromtimestamp(created_ts)
@@ -500,14 +502,46 @@ async def _persist_stripe_event(
         if event_type in {"charge.refunded", "payout.failed"} and amount > 0:
             amount = -amount
 
+        concept = _concept_for_event(event_type, obj)
+        settle_id = None
+        if event_type.startswith("payout"):
+            settle_id = str(reference)
+        fee = None
+        net = None
+        gross = None
+        if isinstance(obj.get("fee"), (int, float)):
+            fee = float(obj["fee"]) / 100.0
+        if isinstance(obj.get("amount"), (int, float)) and fee is not None:
+            gross = abs(float(obj["amount"])) / 100.0
+            net = gross - fee
+
+        fp = fingerprint(
+            tenant_id,
+            channel="webhook_stripe",
+            reference=str(reference),
+            amount=amount,
+            tx_date=tx_date,
+            concept=concept,
+            provider_name="stripe",
+        )
+        dup = await db.execute(
+            select(ProviderTransaction.id).where(
+                ProviderTransaction.tenant_id == tenant_id,
+                ProviderTransaction.ingest_fingerprint == fp,
+            )
+        )
+        if dup.scalar_one_or_none() is not None:
+            return
+
         tx = ProviderTransaction(
             tenant_id=tenant_id,
             provider_name="stripe",
             amount=amount,
             transaction_date=tx_date,
-            concept=_concept_for_event(event_type, obj),
+            concept=concept,
             reference=reference,
             matched=0,
+            match_status="pending",
             raw_data=json.dumps(
                 {
                     "event_id": event_id,
@@ -518,6 +552,16 @@ async def _persist_stripe_event(
                     "description": obj.get("description") or obj.get("statement_descriptor"),
                 }
             ),
+            ingest_fingerprint=fp,
+            tx_kind=classify_kind(
+                channel="webhook_stripe",
+                concept=f"{event_type} {concept}",
+                filename=event_type,
+            ),
+            settlement_id=settle_id,
+            gross_amount=gross,
+            fee_amount=fee,
+            net_amount=net,
         )
         db.add(tx)
 
