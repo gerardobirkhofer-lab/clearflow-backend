@@ -188,11 +188,19 @@ async def upload_provider_report(
     }
 
 @router.get("/")
-async def list_provider_transactions(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_provider_transactions(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+    limit: int = 200,
+):
+    tenant_id = assert_tenant_access(tenant_id, current_user)
+    limit = max(1, min(int(limit or 200), 1000))
     result = await db.execute(
         select(ProviderTransaction)
         .where(ProviderTransaction.tenant_id == tenant_id)
         .order_by(ProviderTransaction.transaction_date.desc())
+        .limit(limit)
     )
     txs = result.scalars().all()
     return {
@@ -205,10 +213,20 @@ async def list_provider_transactions(tenant_id: uuid.UUID, db: AsyncSession = De
                 "transaction_date": t.transaction_date.isoformat() if t.transaction_date else None,
                 "reference": t.reference,
                 "filename": t.filename,
-                "matched": t.matched,
+                "matched": bool(t.matched),
+                "match_status": getattr(t, "match_status", None)
+                or ("confirmed" if t.matched else "pending"),
+                "match_evidence": getattr(t, "match_evidence", None),
+                "tx_kind": getattr(t, "tx_kind", None),
+                "gross_amount": getattr(t, "gross_amount", None),
+                "fee_amount": getattr(t, "fee_amount", None),
+                "net_amount": getattr(t, "net_amount", None),
+                "settlement_id": getattr(t, "settlement_id", None),
             }
             for t in txs
-        ]
+        ],
+        "returned_count": len(txs),
+        "limit": limit,
     }
 
 def _get_field(row: dict, keys: list) -> str:
@@ -270,8 +288,13 @@ def _parse_date(val):
 
 
 @router.get("/list")
-async def list_providers(tenant_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+async def list_providers(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
     """List all providers configured for a tenant."""
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     result = await db.execute(
         select(Provider).where(Provider.tenant_id == tenant_id)
     )
@@ -302,9 +325,11 @@ async def update_provider(
     fee_percent: float = None,
     fee_fixed: float = None,
     monthly_fee: float = None,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
     """Update provider settings (dispute email, fees, etc.)."""
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     result = await db.execute(
         select(Provider).where(
             Provider.id == provider_id,

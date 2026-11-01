@@ -340,6 +340,9 @@ async def open_banking_callback(
                     extra["user_access_token_expires_at"] = (
                         datetime.utcnow() + timedelta(seconds=int(expires_in))
                     ).isoformat()
+            # Successful re-link clears expired-auth flag
+            extra.pop("needs_reconnect", None)
+            extra.pop("reconnect_reason", None)
             conn.extra_data = extra
             conn.last_sync_at = None
             await db.commit()
@@ -450,17 +453,31 @@ async def list_connections(
         data = dict(extra or {})
         # Never expose live user tokens in API responses
         if data.get("user_access_token"):
+            data["has_user_access_token"] = True
             data["user_access_token"] = "[redacted]"
+        else:
+            data["has_user_access_token"] = False
         return data
+
+    def _effective_status(c: ProviderConnection) -> str:
+        status = (c.status or "").lower()
+        extra = c.extra_data if isinstance(c.extra_data, dict) else {}
+        if status in ("needs_reconnect", "expired", "revoked") or extra.get("needs_reconnect"):
+            return "needs_reconnect"
+        return c.status or "unknown"
 
     return {
         "tenant_id": str(tenant_id),
         "provider": _provider_name(),
+        "reconnect_hint": (
+            "Si el estado es needs_reconnect, volvé a Conectar banco. "
+            "Los movimientos ya sincronizados no se borran."
+        ),
         "connections": [
             {
                 "institution_id": c.account_id,
                 "provider": c.provider_name,
-                "status": c.status,
+                "status": _effective_status(c),
                 "last_sync_at": c.last_sync_at.isoformat() if c.last_sync_at else None,
                 "extra": _public_extra(c.extra_data if isinstance(c.extra_data, dict) else {}),
             }
@@ -583,17 +600,36 @@ async def sync_transactions(
         extra = dict(conn.extra_data or {})
         extra["last_sync_count"] = synced
         extra["provider"] = client.name
+        if synced > 0 or not account_errors:
+            conn.status = "connected"
+            extra.pop("needs_reconnect", None)
+            extra.pop("reconnect_reason", None)
         conn.extra_data = extra
 
     await db.commit()
 
     if accounts_seen > 0 and synced == 0 and len(account_errors) >= accounts_seen:
         joined = "; ".join(account_errors[:3])
+        auth_failed = any(
+            "token" in e.lower() or "unauthor" in e.lower() or "401" in e
+            for e in account_errors
+        )
+        if auth_failed:
+            for conn in conns:
+                conn.status = "needs_reconnect"
+                extra = dict(conn.extra_data or {})
+                extra["needs_reconnect"] = True
+                extra["reconnect_reason"] = joined[:500]
+                # Drop unusable token so list_connections surfaces reconnect
+                extra.pop("user_access_token", None)
+                conn.extra_data = extra
+            await db.commit()
         raise HTTPException(
-            status_code=401 if any("token" in e.lower() or "unauthor" in e.lower() or "401" in e for e in account_errors) else 502,
+            status_code=401 if auth_failed else 502,
             detail=(
                 "No se pudieron sincronizar las cuentas. "
-                "La autorización del banco probablemente caducó: volvé a conectar el banco. "
+                "La autorización del banco probablemente caducó: volvé a conectar el banco "
+                "(Setup → Reconectar). Los movimientos ya importados se conservan. "
                 f"Detalle: {joined}"
             ),
         )
