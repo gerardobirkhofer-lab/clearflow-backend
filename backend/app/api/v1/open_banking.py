@@ -515,33 +515,66 @@ async def sync_transactions(
                 account_errors.append(str(exc))
                 continue
 
-            for tx in txs:
-                existing = await db.execute(
-                    select(BankTransaction).where(
-                        BankTransaction.tenant_id == tenant_id,
-                        BankTransaction.reference == str(tx.reference)[:255],
-                    )
-                )
-                if existing.scalar_one_or_none():
-                    continue
+            from app.services.ingest_utils import fingerprint, classify_kind
 
+            for tx in txs:
                 date_str = tx.booking_date
                 try:
                     tx_date = datetime.fromisoformat(date_str) if date_str else datetime.utcnow()
                 except ValueError:
                     tx_date = datetime.utcnow()
 
+                ref = str(tx.reference)[:255] if tx.reference else None
+                concept = str(tx.concept)[:2000] if tx.concept else ""
+                fp = fingerprint(
+                    tenant_id,
+                    channel="open_banking",
+                    reference=ref,
+                    amount=tx.amount,
+                    tx_date=tx_date,
+                    concept=concept,
+                    filename="open_banking",
+                    provider_name=institution_id,
+                )
+
+                existing = await db.execute(
+                    select(BankTransaction.id).where(
+                        BankTransaction.tenant_id == tenant_id,
+                        BankTransaction.ingest_fingerprint == fp,
+                    )
+                )
+                if existing.scalar_one_or_none() is not None:
+                    continue
+                # Legacy dedupe for rows ingested before fingerprint existed
+                if ref:
+                    legacy = await db.execute(
+                        select(BankTransaction.id).where(
+                            BankTransaction.tenant_id == tenant_id,
+                            BankTransaction.reference == ref,
+                            BankTransaction.filename == "open_banking",
+                        )
+                    )
+                    if legacy.scalar_one_or_none() is not None:
+                        continue
+
                 db.add(
                     BankTransaction(
                         tenant_id=tenant_id,
                         bank_name=institution_id,
                         transaction_date=tx_date,
-                        concept=str(tx.concept)[:2000],
+                        concept=concept,
                         amount=tx.amount,
-                        reference=str(tx.reference)[:255],
+                        reference=ref,
                         matched=0,
+                        match_status="pending",
                         filename="open_banking",
                         raw_data=json.dumps(tx.raw),
+                        ingest_fingerprint=fp,
+                        tx_kind=classify_kind(
+                            channel="open_banking",
+                            filename="open_banking",
+                            concept=concept,
+                        ),
                     )
                 )
                 synced += 1

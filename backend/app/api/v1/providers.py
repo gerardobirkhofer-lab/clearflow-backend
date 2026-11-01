@@ -6,7 +6,9 @@ import csv
 import io
 from datetime import datetime
 
-from app.core.database import get_db
+from app.core.auth import CurrentUser, get_current_user
+from app.core.database import get_db, get_shared_db
+from app.core.tenant import assert_tenant_access
 from app.models.provider_transaction import ProviderTransaction
 from app.models.provider import Provider
 from app.models_orm import Tenant
@@ -18,8 +20,22 @@ async def upload_provider_report(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
     provider_name: str = Form(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    Provider settlement / sale CSV — complementary to Open Banking.
+    OB brings bank movements; this brings sale lines + gross/fee/net packs.
+    Idempotent via ingest_fingerprint; bad rows reported, not silent-dropped.
+    """
+    from app.services.ingest_utils import (
+        fingerprint,
+        classify_kind,
+        extract_fee_fields,
+        settlement_id_from_row,
+    )
+
+    tenant_id = assert_tenant_access(tenant_id, current_user)
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
     if not tenant:
@@ -28,55 +44,147 @@ async def upload_provider_report(
     content = await file.read()
     filename = file.filename or "unknown"
 
-    if not filename.endswith('.csv'):
+    if not filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files supported")
 
     try:
-        decoded = content.decode('utf-8-sig')
-    except:
-        decoded = content.decode('latin-1')
+        decoded = content.decode("utf-8-sig")
+    except Exception:
+        decoded = content.decode("latin-1")
 
-    lines = decoded.split('\n')[:3]
-    semi_count = sum(line.count(';') for line in lines)
-    delimiter = ';' if semi_count > sum(line.count(',') for line in lines) else ','
+    lines = decoded.split("\n")[:3]
+    semi_count = sum(line.count(";") for line in lines)
+    delimiter = ";" if semi_count > sum(line.count(",") for line in lines) else ","
 
-    transactions = []
     reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
+    headers = [h.strip().lower() for h in (reader.fieldnames or []) if h]
+    kind = classify_kind(
+        channel="provider_csv",
+        filename=filename,
+        headers=headers,
+    )
 
-    for row in reader:
-        clean_row = {k.strip().lower() if k else '': v for k, v in row.items()}
-        concept = _get_field(clean_row, ['concepto', 'descripcion', 'description', 'concept', 'detalle', 'tipo'])
-        amount = _parse_amount(_get_field(clean_row, ['liquido', 'net', 'importe', 'amount', 'cantidad', 'valor', 'total']))
-        tx_date = _parse_date(_get_field(clean_row, ['fecha', 'date', 'fecha valor', 'fecha operacion']))
-        reference = _get_field(clean_row, ['referencia', 'reference', 'ref', 'numero', 'id'])
+    inserted = 0
+    skipped_dupes = 0
+    rejected_rows: list[dict] = []
+    transactions: list[ProviderTransaction] = []
+    seen_fps: set[str] = set()
 
-        if not concept and not amount:
+    for line_no, row in enumerate(reader, start=2):
+        clean_row = {k.strip().lower() if k else "": v for k, v in row.items()}
+        if not any(str(v or "").strip() for v in clean_row.values()):
+            rejected_rows.append({"line": line_no, "reason": "empty_row"})
             continue
 
-        tx = ProviderTransaction(
-            tenant_id=tenant_id,
-            provider_name=provider_name,
+        concept = _get_field(
+            clean_row,
+            ["concepto", "descripcion", "description", "concept", "detalle", "tipo"],
+        )
+        fees = extract_fee_fields(clean_row, _parse_amount)
+        # Prefer net for bank-facing amount; fall back to importe/amount
+        amount_raw = _get_field(
+            clean_row,
+            ["liquido", "líquido", "net", "neto", "importe neto", "net_amount", "payout"],
+        )
+        if not amount_raw:
+            amount_raw = _get_field(
+                clean_row, ["importe", "amount", "cantidad", "valor", "total", "bruto", "gross"]
+            )
+        amount = _parse_amount(amount_raw)
+        if fees.get("net_amount") is not None and not amount_raw:
+            amount = float(fees["net_amount"])
+
+        tx_date = _parse_date(
+            _get_field(clean_row, ["fecha", "date", "fecha valor", "fecha operacion", "fecha operación"])
+        )
+        reference = _get_field(
+            clean_row, ["referencia", "reference", "ref", "numero", "número", "id", "order_id"]
+        )
+        settle_id = settlement_id_from_row(clean_row)
+
+        if not concept and not amount and not reference:
+            rejected_rows.append({"line": line_no, "reason": "missing_fields"})
+            continue
+        if amount == 0.0 and not amount_raw and fees.get("net_amount") is None:
+            rejected_rows.append({"line": line_no, "reason": "missing_amount", "concept": (concept or "")[:80]})
+            continue
+
+        row_kind = classify_kind(
+            channel="provider_csv",
             filename=filename,
             concept=concept,
-            amount=amount,
-            transaction_date=tx_date,
-            reference=reference,
-            raw_data=str(row),
-            matched=0,
-        )
-        transactions.append(tx)
+            headers=headers,
+        ) or kind
 
-    if not transactions:
-        raise HTTPException(status_code=400, detail="No valid transactions found")
+        fp = fingerprint(
+            tenant_id,
+            channel="provider_csv",
+            reference=reference or settle_id,
+            amount=amount,
+            tx_date=tx_date,
+            concept=concept,
+            filename=filename,
+            provider_name=provider_name,
+        )
+        if fp in seen_fps:
+            skipped_dupes += 1
+            continue
+        seen_fps.add(fp)
+
+        existing = await db.execute(
+            select(ProviderTransaction.id).where(
+                ProviderTransaction.tenant_id == tenant_id,
+                ProviderTransaction.ingest_fingerprint == fp,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            skipped_dupes += 1
+            continue
+
+        transactions.append(
+            ProviderTransaction(
+                tenant_id=tenant_id,
+                provider_name=provider_name,
+                filename=filename,
+                concept=concept,
+                amount=amount,
+                transaction_date=tx_date,
+                reference=reference or None,
+                raw_data=str(row),
+                matched=0,
+                match_status="pending",
+                ingest_fingerprint=fp,
+                tx_kind=row_kind,
+                gross_amount=fees.get("gross_amount"),
+                fee_amount=fees.get("fee_amount"),
+                net_amount=fees.get("net_amount"),
+                settlement_id=settle_id,
+            )
+        )
+        inserted += 1
+
+    if not transactions and skipped_dupes == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "No valid transactions found",
+                "rejected_rows": rejected_rows[:50],
+                "rejected_count": len(rejected_rows),
+            },
+        )
 
     for tx in transactions:
         db.add(tx)
-
     await db.commit()
 
     return {
-        "message": f"Successfully processed {len(transactions)} {provider_name} transactions",
-        "count": len(transactions)
+        "message": f"Processed {provider_name}: {inserted} new, {skipped_dupes} duplicates skipped",
+        "count": inserted,
+        "skipped_duplicates": skipped_dupes,
+        "rejected_rows": rejected_rows[:100],
+        "rejected_count": len(rejected_rows),
+        "tx_kind": kind,
+        "channel": "provider_csv",
     }
 
 @router.get("/")

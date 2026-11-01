@@ -35,77 +35,138 @@ async def upload_statement(
     db: AsyncSession = Depends(get_shared_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
+    """
+    Bank CSV ingest with idempotency + per-row errors.
+    CSV remains required as backup / history and when OB consent is down —
+    it does not replace Open Banking; it complements it.
+    """
+    from app.services.ingest_utils import (
+        classify_kind,
+        extract_fee_fields,
+        fingerprint,
+        settlement_id_from_row,
+    )
+
     tenant_id = assert_tenant_access(tenant_id, current_user)
-    # Verify tenant exists
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
     if not tenant:
         raise HTTPException(status_code=400, detail=f"Tenant {tenant_id} does not exist. Please log out and back in.")
-    
+
     content = await file.read()
     filename = file.filename or "unknown"
-    
-    if not filename.endswith('.csv'):
+    if not filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files supported. Please export as CSV.")
-    
+
     try:
-        decoded = content.decode('utf-8-sig')  # Handle BOM
-    except:
-        decoded = content.decode('latin-1')
-    
-    # Detect delimiter by counting ; vs , in first 3 lines
-    lines = decoded.split('\n')[:3]
-    semi_count = sum(line.count(';') for line in lines)
-    comma_count = sum(line.count(',') for line in lines)
-    delimiter = ';' if semi_count > comma_count else ','
-    
+        decoded = content.decode("utf-8-sig")
+    except Exception:
+        decoded = content.decode("latin-1")
+
+    lines = decoded.split("\n")[:3]
+    semi_count = sum(line.count(";") for line in lines)
+    comma_count = sum(line.count(",") for line in lines)
+    delimiter = ";" if semi_count > comma_count else ","
+
     reader = csv.DictReader(io.StringIO(decoded), delimiter=delimiter)
-    
+    headers = [((h or "").strip().lower()) for h in (reader.fieldnames or [])]
+
     batch = []
-    total_count = 0
-    
+    inserted = 0
+    skipped_dupes = 0
+    rejected_rows: list[dict] = []
+    seen_fps: set[str] = set()
+    line_no = 1  # header is line 1
+
     for row in reader:
-        # Clean up keys (strip whitespace, lowercase)
-        clean_row = {k.strip().lower() if k else '': v for k, v in row.items()}
-        
-        concept = _get_field(clean_row, ['concepto', 'descripcion', 'description', 'concept', 'detalle'])
-        amount = _parse_amount(_get_field(clean_row, ['movimiento', 'importe', 'amount', 'cantidad', 'valor']))
-        tx_date = _parse_date(_get_field(clean_row, ['fecha', 'date', 'fecha valor', 'fecha operacion']))
-        reference = _get_field(clean_row, ['referencia', 'reference', 'ref', 'numero'])
-        balance = _parse_amount(_get_field(clean_row, ['saldo', 'balance']))
-        
-        if not concept and not amount:
-            continue  # Skip empty rows
-        
+        line_no += 1
+        clean_row = {k.strip().lower() if k else "": v for k, v in row.items()}
+        concept = _get_field(clean_row, ["concepto", "descripcion", "description", "concept", "detalle"])
+        amount = _parse_amount(_get_field(clean_row, ["movimiento", "importe", "amount", "cantidad", "valor"]))
+        tx_date = _parse_date(_get_field(clean_row, ["fecha", "date", "fecha valor", "fecha operacion"]))
+        reference = _get_field(clean_row, ["referencia", "reference", "ref", "numero"])
+        balance = _parse_amount(_get_field(clean_row, ["saldo", "balance"]))
+        fees = extract_fee_fields(clean_row, _parse_amount)
+        settlement_id = settlement_id_from_row(clean_row)
+
+        if not concept and amount == 0.0 and not reference:
+            rejected_rows.append({"line": line_no, "reason": "empty_row"})
+            continue
+        if amount == 0.0 and not _get_field(clean_row, ["movimiento", "importe", "amount", "cantidad", "valor"]):
+            rejected_rows.append({"line": line_no, "reason": "missing_amount", "concept": concept[:80]})
+            continue
+        if tx_date is None and _get_field(clean_row, ["fecha", "date", "fecha valor", "fecha operacion"]):
+            rejected_rows.append({"line": line_no, "reason": "unparseable_date", "concept": concept[:80]})
+
+        fp = fingerprint(
+            tenant_id,
+            channel="bank_csv",
+            reference=reference or None,
+            amount=amount,
+            tx_date=tx_date,
+            concept=concept,
+            filename=filename,
+        )
+        if fp in seen_fps:
+            skipped_dupes += 1
+            continue
+        seen_fps.add(fp)
+
+        existing = await db.execute(
+            select(BankTransaction.id).where(
+                BankTransaction.tenant_id == tenant_id,
+                BankTransaction.ingest_fingerprint == fp,
+            ).limit(1)
+        )
+        if existing.scalar_one_or_none():
+            skipped_dupes += 1
+            continue
+
+        kind = classify_kind(channel="bank_csv", filename=filename, concept=concept, headers=headers)
+        primary_amount = amount
+        if fees.get("net_amount") is not None and abs(fees["net_amount"] or 0) > 0:
+            # Prefer net for bank-side settlement credits when provided
+            primary_amount = fees["net_amount"]  # type: ignore[assignment]
+
         tx = BankTransaction(
             tenant_id=tenant_id,
             filename=filename,
             concept=concept,
-            amount=amount,
+            amount=primary_amount,
             transaction_date=tx_date,
-            reference=reference,
-            balance=balance,
+            reference=reference or None,
+            balance=balance if balance else None,
             raw_data=str(row),
             matched=0,
+            match_status="pending",
+            ingest_fingerprint=fp,
+            tx_kind=kind,
+            gross_amount=fees.get("gross_amount"),
+            fee_amount=fees.get("fee_amount"),
+            net_amount=fees.get("net_amount"),
+            settlement_id=settlement_id,
         )
         batch.append(tx)
-        total_count += 1
-        
-        # Flush batch to DB every BATCH_SIZE to avoid memory issues and long transactions
+        inserted += 1
+
         if len(batch) >= BATCH_SIZE:
             db.add_all(batch)
             await db.commit()
             batch = []
-    
-    # Flush remaining batch
+
     if batch:
         db.add_all(batch)
         await db.commit()
-    
-    if total_count == 0:
-        raise HTTPException(status_code=400, detail="No valid transactions found in the file. Check the column headers.")
-    
-    # Same engine as Payment Check "Run" (Phase 0: one reconciler)
+
+    if inserted == 0 and skipped_dupes == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "No valid transactions found in the file. Check the column headers.",
+                "rejected_rows": rejected_rows[:50],
+            },
+        )
+
     reconciliation: dict | None = None
     try:
         from app.api.v1.reconciliation import execute_reconciliation
@@ -122,10 +183,31 @@ async def upload_statement(
         }
 
     return {
-        "message": f"Successfully processed {total_count} transactions",
-        "count": total_count,
+        "message": f"Inserted {inserted} bank rows ({skipped_dupes} duplicates skipped)",
+        "count": inserted,
+        "inserted": inserted,
+        "skipped_duplicates": skipped_dupes,
+        "rejected_rows": rejected_rows[:100],
+        "rejected_count": len(rejected_rows),
         "reconciliation": reconciliation,
+        "channel": "csv_bank",
+        "note": "CSV complements Open Banking; it does not replace live bank sync.",
     }
+
+
+@router.get("/intake-channels")
+async def intake_channels(
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Product truth: which ports deliver what.
+    Open Banking ≠ POS settlement packs — CSV/API reports fill that gap.
+    """
+    from app.services.ingest_utils import intake_channels_doc
+
+    _ = current_user  # auth required; doc is tenant-agnostic
+    return intake_channels_doc()
+
 
 def _get_field(row: dict, keys: list) -> str:
     for key in keys:

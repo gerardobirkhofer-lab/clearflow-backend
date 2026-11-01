@@ -27,4 +27,11 @@ class BankTransaction(Base):
     match_status = Column(String(32), nullable=False, default="pending", index=True)
     match_evidence = Column(Text, nullable=True)  # JSON: rules, counterpart id, amounts, dates
     matched_at = Column(DateTime, nullable=True)
+    # Ingest / trust layer
+    ingest_fingerprint = Column(String(64), nullable=True, index=True)
+    tx_kind = Column(String(32), nullable=False, default="bank_movement", index=True)
+    gross_amount = Column(Float, nullable=True)
+    fee_amount = Column(Float, nullable=True)
+    net_amount = Column(Float, nullable=True)
+    settlement_id = Column(String(255), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now())

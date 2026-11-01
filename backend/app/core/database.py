@@ -259,6 +259,74 @@ async def init_db() -> None:
                       ALTER TABLE provider_transactions ADD COLUMN matched_at TIMESTAMP;
                     END IF;
                   END IF;
+
+                  -- bank_transactions ingest columns
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                  ) THEN
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                        AND column_name = 'ingest_fingerprint'
+                    ) THEN
+                      ALTER TABLE bank_transactions ADD COLUMN ingest_fingerprint VARCHAR(64);
+                      CREATE INDEX IF NOT EXISTS ix_bank_tx_fingerprint
+                        ON bank_transactions (tenant_id, ingest_fingerprint);
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                        AND column_name = 'tx_kind'
+                    ) THEN
+                      ALTER TABLE bank_transactions
+                        ADD COLUMN tx_kind VARCHAR(32) NOT NULL DEFAULT 'bank_movement';
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'bank_transactions'
+                        AND column_name = 'gross_amount'
+                    ) THEN
+                      ALTER TABLE bank_transactions ADD COLUMN gross_amount DOUBLE PRECISION;
+                      ALTER TABLE bank_transactions ADD COLUMN fee_amount DOUBLE PRECISION;
+                      ALTER TABLE bank_transactions ADD COLUMN net_amount DOUBLE PRECISION;
+                      ALTER TABLE bank_transactions ADD COLUMN settlement_id VARCHAR(255);
+                    END IF;
+                  END IF;
+
+                  -- provider_transactions ingest columns
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                  ) THEN
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'ingest_fingerprint'
+                    ) THEN
+                      ALTER TABLE provider_transactions ADD COLUMN ingest_fingerprint VARCHAR(64);
+                      CREATE INDEX IF NOT EXISTS ix_prov_tx_fingerprint
+                        ON provider_transactions (tenant_id, ingest_fingerprint);
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'tx_kind'
+                    ) THEN
+                      ALTER TABLE provider_transactions
+                        ADD COLUMN tx_kind VARCHAR(32) NOT NULL DEFAULT 'sale_detail';
+                    END IF;
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'provider_transactions'
+                        AND column_name = 'gross_amount'
+                    ) THEN
+                      ALTER TABLE provider_transactions ADD COLUMN gross_amount DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions ADD COLUMN fee_amount DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions ADD COLUMN net_amount DOUBLE PRECISION;
+                      ALTER TABLE provider_transactions ADD COLUMN settlement_id VARCHAR(255);
+                    END IF;
+                  END IF;
                 END
                 $$;
                 """

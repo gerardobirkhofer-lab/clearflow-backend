@@ -24,9 +24,8 @@ from app.models.provider_transaction import ProviderTransaction
 
 router = APIRouter()
 
-ENGINE = "clearflow_v2_trust"
-# Auto-confirm only when reference is exact AND amount is exact (within 1 cent)
-# AND dates are within this many days (if both dates exist).
+ENGINE = "clearflow_v3_trust_fees"
+# Auto-confirm only with strong evidence (no client click).
 AUTO_CONFIRM_MAX_DAY_DIFF = 3
 
 
@@ -47,14 +46,37 @@ def _day_diff(a, b) -> int | None:
         return None
 
 
+def _amount_candidates(p_amount, p_gross, p_fee, p_net) -> list[tuple[float, str]]:
+    """Provider amounts that may legitimately equal a bank credit."""
+    out: list[tuple[float, str]] = []
+    if p_net is not None:
+        out.append((float(p_net), "provider_net"))
+    if p_amount is not None:
+        out.append((float(p_amount), "provider_amount"))
+    if p_gross is not None and p_fee is not None:
+        out.append((float(p_gross) - float(p_fee), "provider_gross_minus_fee"))
+    # de-dupe by rounded value
+    seen = set()
+    uniq = []
+    for val, label in out:
+        key = round(val, 2)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((val, label))
+    return uniq
+
+
 def evaluate_auto_confirm(
     b_amount, b_date, b_ref, b_conc,
     p_amount, p_date, p_ref, p_conc,
+    p_gross=None, p_fee=None, p_net=None,
+    b_settlement_id=None, p_settlement_id=None,
 ) -> tuple[bool, dict]:
     """
-    Returns (should_confirm, evidence).
-    Strict: non-empty equal references + amount within €0.01.
-    Date alignment strengthens evidence but missing dates do not block if refs+amount hold.
+    Auto-confirm when:
+      - same non-empty reference (or same settlement_id), AND
+      - bank amount equals provider amount OR net OR gross-fee (within €0.01)
     Fuzzy concept-only matches NEVER auto-confirm.
     """
     evidence: dict = {
@@ -62,28 +84,47 @@ def evaluate_auto_confirm(
         "rules_fired": [],
         "bank_amount": b_amount,
         "provider_amount": p_amount,
+        "provider_gross": p_gross,
+        "provider_fee": p_fee,
+        "provider_net": p_net,
         "bank_ref": b_ref,
         "provider_ref": p_ref,
         "bank_date": b_date.isoformat() if b_date else None,
         "provider_date": p_date.isoformat() if p_date else None,
+        "settlement_id": p_settlement_id or b_settlement_id,
     }
 
     n_bank = _norm_ref(b_ref)
     n_prov = _norm_ref(p_ref)
-    if not n_bank or not n_prov or n_bank != n_prov:
+    n_settle_b = _norm_ref(b_settlement_id)
+    n_settle_p = _norm_ref(p_settlement_id)
+
+    ref_ok = bool(n_bank and n_prov and n_bank == n_prov)
+    settle_ok = bool(n_settle_b and n_settle_p and n_settle_b == n_settle_p)
+    if not ref_ok and not settle_ok:
         evidence["reject_reason"] = "missing_or_mismatched_reference"
         return False, evidence
-    evidence["rules_fired"].append("exact_reference")
+    if ref_ok:
+        evidence["rules_fired"].append("exact_reference")
+    if settle_ok:
+        evidence["rules_fired"].append("exact_settlement_id")
 
-    if b_amount is None or p_amount is None:
-        evidence["reject_reason"] = "missing_amount"
+    if b_amount is None:
+        evidence["reject_reason"] = "missing_bank_amount"
         return False, evidence
-    amt_diff = abs(float(b_amount) - float(p_amount))
-    evidence["amount_diff"] = amt_diff
-    if amt_diff >= 0.01:
-        evidence["reject_reason"] = "amount_not_exact"
+
+    amount_ok = False
+    for cand, label in _amount_candidates(p_amount, p_gross, p_fee, p_net):
+        diff = abs(float(b_amount) - cand)
+        if diff < 0.01:
+            evidence["amount_diff"] = diff
+            evidence["amount_rule"] = label
+            evidence["rules_fired"].append(f"exact_amount:{label}")
+            amount_ok = True
+            break
+    if not amount_ok:
+        evidence["reject_reason"] = "amount_not_exact_vs_amount_or_net_or_gross_minus_fee"
         return False, evidence
-    evidence["rules_fired"].append("exact_amount")
 
     days = _day_diff(b_date, p_date)
     evidence["day_diff"] = days
@@ -95,7 +136,6 @@ def evaluate_auto_confirm(
     else:
         evidence["rules_fired"].append("date_unavailable_ok_with_ref_amount")
 
-    # Concept similarity is informational only — never required for auto-confirm
     if b_conc and p_conc:
         bc, pc = str(b_conc).lower(), str(p_conc).lower()
         if bc and pc and (bc in pc or pc in bc):
@@ -119,6 +159,10 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
             ProviderTransaction.transaction_date,
             ProviderTransaction.reference,
             ProviderTransaction.concept,
+            ProviderTransaction.gross_amount,
+            ProviderTransaction.fee_amount,
+            ProviderTransaction.net_amount,
+            ProviderTransaction.settlement_id,
         ).where(
             ProviderTransaction.tenant_id == tenant_id,
             ProviderTransaction.matched == 0,
@@ -126,12 +170,16 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
     )
     prov_rows = list(prov_result.all())
 
-    # Index by normalized reference for O(1) strong matches; also amount buckets as fallback scan
+    # Index by normalized reference / settlement_id for O(1) strong matches
     prov_by_ref: dict[str, list] = defaultdict(list)
+    prov_by_settle: dict[str, list] = defaultdict(list)
     for p in prov_rows:
         nref = _norm_ref(p[3])
         if nref:
             prov_by_ref[nref].append(p)
+        nsettle = _norm_ref(p[8])
+        if nsettle:
+            prov_by_settle[nsettle].append(p)
 
     bank_count = await db.scalar(
         select(func.count()).where(
@@ -156,6 +204,7 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
                     BankTransaction.transaction_date,
                     BankTransaction.reference,
                     BankTransaction.concept,
+                    BankTransaction.settlement_id,
                 )
                 .where(
                     BankTransaction.tenant_id == tenant_id,
@@ -168,16 +217,31 @@ async def execute_reconciliation(db: AsyncSession, tenant_id: uuid.UUID) -> dict
         if not bank_batch:
             break
 
-        for b_id, b_amount, b_date, b_ref, b_conc in bank_batch:
+        for b_id, b_amount, b_date, b_ref, b_conc, b_settle in bank_batch:
             nref = _norm_ref(b_ref)
-            candidates = [p for p in prov_by_ref.get(nref, []) if p[0] not in used_prov_ids]
+            nsettle = _norm_ref(b_settle)
+            seen_pids: set[int] = set()
+            candidates = []
+            for p in prov_by_ref.get(nref, []):
+                if p[0] not in used_prov_ids and p[0] not in seen_pids:
+                    candidates.append(p)
+                    seen_pids.add(p[0])
+            for p in prov_by_settle.get(nsettle, []):
+                if p[0] not in used_prov_ids and p[0] not in seen_pids:
+                    candidates.append(p)
+                    seen_pids.add(p[0])
 
             confirmed = False
             for p in candidates:
-                pid, p_amount, p_date, p_ref, p_conc = p
+                (
+                    pid, p_amount, p_date, p_ref, p_conc,
+                    p_gross, p_fee, p_net, p_settle,
+                ) = p
                 ok, evidence = evaluate_auto_confirm(
                     b_amount, b_date, b_ref, b_conc,
                     p_amount, p_date, p_ref, p_conc,
+                    p_gross=p_gross, p_fee=p_fee, p_net=p_net,
+                    b_settlement_id=b_settle, p_settlement_id=p_settle,
                 )
                 if not ok:
                     continue
