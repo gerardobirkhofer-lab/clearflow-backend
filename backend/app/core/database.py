@@ -327,6 +327,22 @@ async def init_db() -> None:
                       ALTER TABLE provider_transactions ADD COLUMN settlement_id VARCHAR(255);
                     END IF;
                   END IF;
+
+                  -- Provider contract terms for Strategy Reconstruct
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'providers'
+                  ) THEN
+                    IF NOT EXISTS (
+                      SELECT 1 FROM information_schema.columns
+                      WHERE table_schema = 'public' AND table_name = 'providers'
+                        AND column_name = 'has_iva'
+                    ) THEN
+                      ALTER TABLE providers ADD COLUMN has_iva INTEGER DEFAULT 0;
+                      ALTER TABLE providers ADD COLUMN iva_percent DOUBLE PRECISION DEFAULT 21.0;
+                      ALTER TABLE providers ADD COLUMN payout_destination VARCHAR(20) DEFAULT 'bank';
+                    END IF;
+                  END IF;
                 END
                 $$;
                 """

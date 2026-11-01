@@ -287,33 +287,111 @@ def _parse_date(val):
     return None
 
 
+def _provider_public(p: Provider) -> dict:
+    return {
+        "id": p.id,
+        "name": p.name,
+        "provider_type": p.provider_type,
+        "settlement_mode": p.settlement_mode,
+        "credit_delay_days": p.credit_delay_days,
+        "fee_percent": p.fee_percent,
+        "fee_fixed": p.fee_fixed,
+        "monthly_fee": p.monthly_fee,
+        "has_iva": bool(getattr(p, "has_iva", 0)),
+        "iva_percent": getattr(p, "iva_percent", 21.0),
+        "payout_destination": getattr(p, "payout_destination", None) or "bank",
+        "dispute_email": p.dispute_email,
+        "contract_file_url": p.contract_file_url,
+        "is_active": p.is_active,
+    }
+
+
 @router.get("/list")
 async def list_providers(
     tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_shared_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    """List all providers configured for a tenant."""
+    """List all providers configured for a tenant (includes contract terms)."""
     tenant_id = assert_tenant_access(tenant_id, current_user)
     result = await db.execute(
         select(Provider).where(Provider.tenant_id == tenant_id)
     )
     providers = result.scalars().all()
+    return {"providers": [_provider_public(p) for p in providers]}
+
+
+@router.post("/contracts/sync")
+async def sync_provider_contracts(
+    payload: dict,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Upsert liquidadora contract terms from Setup (source of truth for Mode B).
+    Body: { tenant_id, providers: [ { name, fee_percent, fee_fixed, ... } ] }
+    """
+    from uuid import UUID as _UUID
+
+    raw_tid = payload.get("tenant_id")
+    tenant_id = assert_tenant_access(
+        _UUID(str(raw_tid)) if raw_tid else None,
+        current_user,
+    )
+    items = payload.get("providers") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="providers[] required")
+
+    upserted = []
+    for item in items:
+        name = (item.get("name") or item.get("id") or "").strip()
+        if not name:
+            continue
+        existing = await db.execute(
+            select(Provider).where(
+                Provider.tenant_id == tenant_id,
+                Provider.name == name,
+            )
+        )
+        p = existing.scalar_one_or_none()
+        if not p:
+            p = Provider(
+                tenant_id=tenant_id,
+                name=name,
+                provider_type=(item.get("provider_type") or item.get("id") or name).lower(),
+            )
+            db.add(p)
+
+        if item.get("fee_percent") is not None and str(item.get("fee_percent")) != "":
+            p.fee_percent = float(item["fee_percent"])
+        if item.get("fee_fixed") is not None and str(item.get("fee_fixed")) != "":
+            p.fee_fixed = float(item["fee_fixed"])
+        if item.get("monthly_fee") is not None and str(item.get("monthly_fee")) != "":
+            p.monthly_fee = float(item["monthly_fee"])
+        if "has_iva" in item:
+            p.has_iva = 1 if item.get("has_iva") else 0
+        if item.get("iva_percent") is not None and str(item.get("iva_percent")) != "":
+            p.iva_percent = float(item["iva_percent"])
+        days = item.get("payout_days") or item.get("credit_delay_days")
+        if days is not None and str(days) != "":
+            p.credit_delay_days = int(float(days))
+        dest = item.get("payout_destination")
+        if item.get("is_virtual_account"):
+            dest = "wallet"
+        if dest:
+            p.payout_destination = str(dest)
+        if item.get("email") or item.get("dispute_email"):
+            p.dispute_email = item.get("dispute_email") or item.get("email")
+        if item.get("contract_file_url"):
+            p.contract_file_url = item["contract_file_url"]
+        p.is_active = 1
+        upserted.append(name)
+
+    await db.commit()
     return {
-        "providers": [
-            {
-                "id": p.id,
-                "name": p.name,
-                "provider_type": p.provider_type,
-                "settlement_mode": p.settlement_mode,
-                "fee_percent": p.fee_percent,
-                "fee_fixed": p.fee_fixed,
-                "monthly_fee": p.monthly_fee,
-                "dispute_email": p.dispute_email,
-                "is_active": p.is_active,
-            }
-            for p in providers
-        ]
+        "message": f"Synced {len(upserted)} contract(s)",
+        "providers": upserted,
+        "note": "Estos términos alimentan Strategy Reconstruct cuando no hay detalle de liquidadora.",
     }
 
 

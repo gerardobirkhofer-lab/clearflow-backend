@@ -19,6 +19,10 @@ class Provider(Base):
     fee_percent = Column(Float, default=0.0)
     fee_fixed = Column(Float, default=0.0)
     monthly_fee = Column(Float, default=0.0)
+    has_iva = Column(Integer, default=0)  # 1 = fees include/add IVA
+    iva_percent = Column(Float, default=21.0)
+    # bank = expect Tink credit; wallet = hold at liquidator
+    payout_destination = Column(String(20), default="bank")
     dispute_email = Column(String(255), nullable=True)
     contract_file_url = Column(String(500), nullable=True)
     is_active = Column(Integer, default=1)
