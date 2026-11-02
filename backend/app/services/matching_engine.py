@@ -32,6 +32,42 @@ def day_diff(a, b) -> int | None:
         return None
 
 
+def compute_score(
+    *,
+    amount_diff: float | None,
+    day_diff_val: int | None,
+    ref_ok: bool,
+    settle_ok: bool,
+    contract_pass: bool,
+    suggested: bool = False,
+) -> int:
+    """0–100 confidence for evidence / trial-report (not a black-box ML score)."""
+    score = 40
+    if ref_ok:
+        score += 20
+    if settle_ok:
+        score += 15
+    if amount_diff is not None:
+        if amount_diff < 0.01:
+            score += 25
+        elif amount_diff <= SUGGEST_MAX_AMOUNT_DIFF:
+            score += 10
+        else:
+            score -= 20
+    if day_diff_val is not None:
+        if day_diff_val <= 1:
+            score += 10
+        elif day_diff_val <= AUTO_CONFIRM_MAX_DAY_DIFF:
+            score += 5
+        else:
+            score -= 15
+    if contract_pass:
+        score += 10
+    if suggested:
+        score = min(score, 79)
+    return max(0, min(100, score))
+
+
 def amount_candidates(
     p_amount, p_gross, p_fee, p_net, contract_expected_net=None
 ) -> list[tuple[float, str]]:
@@ -82,7 +118,10 @@ def evaluate_auto_confirm_1to1(
     contract_expected_net=None,
     gateway_reported_net=None,
     contract_audit_status=None,
-) -> tuple[bool, dict]:
+) -> tuple[str, dict]:
+    """
+    Returns (decision, evidence) where decision is confirmed | suggested | reject.
+    """
     evidence: dict[str, Any] = {
         "engine": ENGINE,
         "match_mode": "1:1",
@@ -111,7 +150,9 @@ def evaluate_auto_confirm_1to1(
     settle_ok = bool(n_settle_b and n_settle_p and n_settle_b == n_settle_p)
     if not ref_ok and not settle_ok:
         evidence["reject_reason"] = "missing_or_mismatched_reference"
-        return False, evidence
+        evidence["decision"] = "reject"
+        evidence["score"] = 0
+        return "reject", evidence
     if ref_ok:
         evidence["rules_fired"].append("exact_reference")
     if settle_ok:
@@ -119,7 +160,9 @@ def evaluate_auto_confirm_1to1(
 
     if b_amount is None:
         evidence["reject_reason"] = "missing_bank_amount"
-        return False, evidence
+        evidence["decision"] = "reject"
+        evidence["score"] = 0
+        return "reject", evidence
 
     # Contractual gate: block if bank aligns with gateway but not with contract
     block = contractual_block_reason(
@@ -129,19 +172,18 @@ def evaluate_auto_confirm_1to1(
         evidence["reject_reason"] = block
         evidence["decision"] = "blocked_contractual_discrepancy"
         evidence["rules_fired"].append("contractual_audit_block")
-        return False, evidence
+        evidence["score"] = 5
+        return "reject", evidence
 
     amount_ok = False
-    # Prefer contract expected net when available
+    best_near: tuple[float, str, float] | None = None  # diff, label, cand
     ordered = amount_candidates(
         p_amount, p_gross, p_fee, p_net, contract_expected_net=contract_expected_net
     )
-    # If we have a contract expected net, bank MUST match it (not merely gateway net)
     if contract_expected_net is not None:
         ordered = [
             (float(contract_expected_net), "contract_expected_net"),
         ] + [x for x in ordered if x[1] != "contract_expected_net"]
-        # Only accept contract_expected_net for auto-confirm when contract exists
         ordered = [x for x in ordered if x[1] == "contract_expected_net"]
 
     for cand, label in ordered:
@@ -152,7 +194,49 @@ def evaluate_auto_confirm_1to1(
             evidence["rules_fired"].append(f"exact_amount:{label}")
             amount_ok = True
             break
+        if best_near is None or diff < best_near[0]:
+            best_near = (diff, label, cand)
+
+    days = day_diff(b_date, p_date)
+    evidence["day_diff"] = days
+
     if not amount_ok:
+        # Near-miss suggest (only when NO contract gate — contract must be exact)
+        if (
+            contract_expected_net is None
+            and best_near is not None
+            and best_near[0] <= SUGGEST_MAX_AMOUNT_DIFF
+        ):
+            if days is not None and days > AUTO_CONFIRM_MAX_DAY_DIFF:
+                evidence["reject_reason"] = "dates_too_far"
+                evidence["decision"] = "reject"
+                evidence["amount_diff"] = best_near[0]
+                evidence["score"] = compute_score(
+                    amount_diff=best_near[0],
+                    day_diff_val=days,
+                    ref_ok=ref_ok,
+                    settle_ok=settle_ok,
+                    contract_pass=False,
+                )
+                return "reject", evidence
+            evidence["amount_diff"] = best_near[0]
+            evidence["amount_rule"] = best_near[1]
+            evidence["rules_fired"].append("near_amount_suggested_not_confirmed")
+            if days is not None:
+                evidence["rules_fired"].append("date_within_window")
+            evidence["decision"] = "suggested"
+            evidence["suggested_by"] = "system_auto"
+            evidence["suggested_at"] = datetime.utcnow().isoformat() + "Z"
+            evidence["score"] = compute_score(
+                amount_diff=best_near[0],
+                day_diff_val=days,
+                ref_ok=ref_ok,
+                settle_ok=settle_ok,
+                contract_pass=False,
+                suggested=True,
+            )
+            return "suggested", evidence
+
         if contract_expected_net is not None:
             evidence["reject_reason"] = "bank_differs_from_contract_expected_net"
             evidence["decision"] = "blocked_contractual_discrepancy"
@@ -160,18 +244,34 @@ def evaluate_auto_confirm_1to1(
                 float(b_amount) - float(contract_expected_net)
             )
             evidence["rules_fired"].append("contractual_audit_block")
+            evidence["score"] = 10
         else:
             evidence["reject_reason"] = "amount_not_exact_vs_amount_or_net_or_gross_minus_fee"
-        return False, evidence
+            evidence["decision"] = "reject"
+            evidence["amount_diff"] = best_near[0] if best_near else None
+            evidence["score"] = compute_score(
+                amount_diff=best_near[0] if best_near else None,
+                day_diff_val=days,
+                ref_ok=ref_ok,
+                settle_ok=settle_ok,
+                contract_pass=False,
+            )
+        return "reject", evidence
 
     if contract_expected_net is not None:
         evidence["rules_fired"].append("contractual_audit_pass")
 
-    days = day_diff(b_date, p_date)
-    evidence["day_diff"] = days
     if days is not None and days > AUTO_CONFIRM_MAX_DAY_DIFF:
         evidence["reject_reason"] = "dates_too_far"
-        return False, evidence
+        evidence["decision"] = "reject"
+        evidence["score"] = compute_score(
+            amount_diff=evidence.get("amount_diff"),
+            day_diff_val=days,
+            ref_ok=ref_ok,
+            settle_ok=settle_ok,
+            contract_pass=contract_expected_net is not None,
+        )
+        return "reject", evidence
     if days is not None:
         evidence["rules_fired"].append("date_within_window")
     else:
@@ -185,7 +285,14 @@ def evaluate_auto_confirm_1to1(
     evidence["decision"] = "confirmed"
     evidence["confirmed_by"] = "system_auto"
     evidence["confirmed_at"] = datetime.utcnow().isoformat() + "Z"
-    return True, evidence
+    evidence["score"] = compute_score(
+        amount_diff=float(evidence.get("amount_diff") or 0),
+        day_diff_val=days,
+        ref_ok=ref_ok,
+        settle_ok=settle_ok,
+        contract_pass=contract_expected_net is not None,
+    )
+    return "confirmed", evidence
 
 
 def evaluate_auto_confirm_1ton(
@@ -204,14 +311,17 @@ def evaluate_auto_confirm_1ton(
     }
     if b_amount is None:
         evidence["reject_reason"] = "missing_bank_amount"
+        evidence["score"] = 0
         return "reject", evidence
     if len(legs) < 2:
         evidence["reject_reason"] = "one_n_needs_at_least_two_legs"
+        evidence["score"] = 0
         return "reject", evidence
 
     group_key = norm_ref(b_settle) or norm_ref(b_ref)
     if not group_key:
         evidence["reject_reason"] = "missing_settlement_or_ref_for_1n"
+        evidence["score"] = 0
         return "reject", evidence
 
     coherent = []
@@ -221,6 +331,7 @@ def evaluate_auto_confirm_1ton(
             coherent.append(p)
     if len(coherent) < 2:
         evidence["reject_reason"] = "legs_not_coherent_on_settlement"
+        evidence["score"] = 0
         return "reject", evidence
 
     far = 0
@@ -231,11 +342,11 @@ def evaluate_auto_confirm_1ton(
     if far:
         evidence["reject_reason"] = "dates_too_far_for_some_legs"
         evidence["legs_out_of_window"] = far
+        evidence["score"] = 15
         return "reject", evidence
     evidence["rules_fired"].append("settlement_group")
     evidence["rules_fired"].append("date_within_window_all_legs")
 
-    # Prefer sum of contract_expected_net when all legs have it
     use_contract = all(
         _unpack_leg(p)[9] is not None for p in coherent
     )
@@ -276,8 +387,8 @@ def evaluate_auto_confirm_1ton(
 
     diff = abs(float(b_amount) - total)
     evidence["amount_diff"] = diff
+    days = day_diff(b_date, coherent[0][2]) if coherent else None
 
-    # If bank equals sum of gateway nets but NOT contract sum → block
     if use_contract and diff >= 0.01:
         gateway_sum = 0.0
         has_gw = True
@@ -292,6 +403,7 @@ def evaluate_auto_confirm_1ton(
             evidence["decision"] = "blocked_contractual_discrepancy"
             evidence["gateway_sum"] = round(gateway_sum, 2)
             evidence["contract_sum"] = round(total, 2)
+            evidence["score"] = 8
             return "reject", evidence
 
     if diff < 0.01:
@@ -301,6 +413,13 @@ def evaluate_auto_confirm_1ton(
         evidence["decision"] = "confirmed"
         evidence["confirmed_by"] = "system_auto"
         evidence["confirmed_at"] = datetime.utcnow().isoformat() + "Z"
+        evidence["score"] = compute_score(
+            amount_diff=diff,
+            day_diff_val=days,
+            ref_ok=True,
+            settle_ok=True,
+            contract_pass=use_contract,
+        )
         return "confirmed", evidence
 
     if diff <= SUGGEST_MAX_AMOUNT_DIFF and not use_contract:
@@ -308,6 +427,14 @@ def evaluate_auto_confirm_1ton(
         evidence["decision"] = "suggested"
         evidence["suggested_by"] = "system_auto"
         evidence["suggested_at"] = datetime.utcnow().isoformat() + "Z"
+        evidence["score"] = compute_score(
+            amount_diff=diff,
+            day_diff_val=days,
+            ref_ok=True,
+            settle_ok=True,
+            contract_pass=False,
+            suggested=True,
+        )
         return "suggested", evidence
 
     if use_contract:
@@ -315,8 +442,16 @@ def evaluate_auto_confirm_1ton(
         evidence["decision"] = "blocked_contractual_discrepancy"
         evidence["contract_sum"] = round(total, 2)
         evidence["rules_fired"].append("contractual_audit_block_1n")
+        evidence["score"] = 12
     else:
         evidence["reject_reason"] = "sum_not_close_to_bank"
+        evidence["score"] = compute_score(
+            amount_diff=diff,
+            day_diff_val=days,
+            ref_ok=True,
+            settle_ok=True,
+            contract_pass=False,
+        )
     return "reject", evidence
 
 

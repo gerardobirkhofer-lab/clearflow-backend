@@ -17,9 +17,11 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import SharedSessionLocal, get_db
+from app.core.auth import CurrentUser, get_current_user
+from app.core.database import get_db, tenant_db_manager
 from app.core.tenant import resolve_tenant_id
 from app.models.bank_transaction import BankTransaction
+from app.models.cash_close import CashClose
 from app.models.dispute import Dispute
 from app.models.provider import Provider
 from app.models.provider_transaction import ProviderTransaction
@@ -36,8 +38,10 @@ from app.services import recon_jobs
 
 router = APIRouter()
 
-# Back-compat aliases for older imports / tests
-evaluate_auto_confirm = evaluate_auto_confirm_1to1
+# Back-compat: older code expected (bool, evidence)
+def evaluate_auto_confirm(*args, **kwargs):
+    decision, evidence = evaluate_auto_confirm_1to1(*args, **kwargs)
+    return decision == "confirmed", evidence
 
 
 async def execute_reconciliation(
@@ -159,7 +163,7 @@ async def execute_reconciliation(
                     p_gross, p_fee, p_net, p_settle,
                     c_net, g_net, c_status,
                 ) = p
-                ok, evidence = evaluate_auto_confirm_1to1(
+                decision_1, evidence = evaluate_auto_confirm_1to1(
                     b_amount, b_date, b_ref, b_conc,
                     p_amount, p_date, p_ref, p_conc,
                     p_gross=p_gross, p_fee=p_fee, p_net=p_net,
@@ -168,7 +172,7 @@ async def execute_reconciliation(
                     gateway_reported_net=g_net,
                     contract_audit_status=c_status,
                 )
-                if not ok:
+                if decision_1 == "reject":
                     last_reject = evidence.get("reject_reason") or last_reject
                     if evidence.get("decision") == "blocked_contractual_discrepancy" or (
                         last_reject
@@ -183,6 +187,16 @@ async def execute_reconciliation(
                 evidence["bank_tx_id"] = b_id
                 evidence["provider_tx_id"] = pid
                 evidence["provider_tx_ids"] = [pid]
+                if decision_1 == "suggested":
+                    suggestions.append({
+                        "bank_id": b_id,
+                        "prov_ids": [pid],
+                        "evidence": evidence,
+                    })
+                    suggested_count += 1
+                    confirmed = True
+                    last_reject = None
+                    break
                 used_prov_ids.add(pid)
                 confirmations.append({
                     "bank_id": b_id,
@@ -555,7 +569,8 @@ async def _run_job(job_id: str, tenant_id: uuid.UUID, date_from, date_to) -> Non
         await recon_jobs.update_job(job_id, progress=pct)
 
     try:
-        async with SharedSessionLocal() as db:
+        maker = await tenant_db_manager.get_session_maker(tenant_id)
+        async with maker() as db:
             result = await execute_reconciliation(
                 db,
                 tenant_id,
@@ -580,18 +595,23 @@ async def run_reconciliation_async(
     date_to: str | None = Query(default=None),
 ):
     """Queue reconciliation; poll GET /jobs/{job_id} for progress."""
-    job_id = await recon_jobs.create_job(tenant_id)
-    background_tasks.add_task(
-        _run_job,
-        job_id,
+    df = _parse_optional_date(date_from)
+    dt = _parse_optional_date(date_to)
+    job_id = await recon_jobs.create_job(
         tenant_id,
-        _parse_optional_date(date_from),
-        _parse_optional_date(date_to),
+        params={
+            "date_from": date_from,
+            "date_to": date_to,
+            "engine": ENGINE,
+        },
     )
+    background_tasks.add_task(_run_job, job_id, tenant_id, df, dt)
     return {
         "job_id": job_id,
         "status": "queued",
         "poll": f"/api/v1/reconciliation/jobs/{job_id}",
+        "date_from": date_from,
+        "date_to": date_to,
     }
 
 
@@ -618,16 +638,29 @@ async def list_reconciliation_jobs(
     return {"jobs": items, "count": len(items)}
 
 
+async def _window_filters(date_from: datetime | None, date_to: datetime | None):
+    filters = []
+    if date_from is not None:
+        filters.append(BankTransaction.transaction_date >= date_from)
+    if date_to is not None:
+        filters.append(BankTransaction.transaction_date <= date_to)
+    return filters
+
+
 @router.get("/status")
 async def get_reconciliation_status(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
     db: AsyncSession = Depends(get_db),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
 ):
-    """Counts: confirmed / suggested / pending."""
+    """Counts: motor-confirmed / user-confirmed / suggested / pending."""
+    df = _parse_optional_date(date_from)
+    dt = _parse_optional_date(date_to)
+    base = [BankTransaction.tenant_id == tenant_id, *(await _window_filters(df, dt))]
+
     bank_transactions = await db.scalar(
-        select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id
-        )
+        select(func.count()).select_from(BankTransaction).where(*base)
     ) or 0
     provider_transactions = await db.scalar(
         select(func.count()).select_from(ProviderTransaction).where(
@@ -635,12 +668,21 @@ async def get_reconciliation_status(
         )
     ) or 0
 
-    confirmed_bank = await db.scalar(
+    motor_confirmed = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id,
+            *base,
+            BankTransaction.match_status == "confirmed",
             BankTransaction.matched == 1,
         )
     ) or 0
+    user_confirmed = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base,
+            BankTransaction.match_status == "user_confirmed",
+            BankTransaction.matched == 1,
+        )
+    ) or 0
+    confirmed_bank = motor_confirmed + user_confirmed
     confirmed_provider = await db.scalar(
         select(func.count()).select_from(ProviderTransaction).where(
             ProviderTransaction.tenant_id == tenant_id,
@@ -649,8 +691,14 @@ async def get_reconciliation_status(
     ) or 0
     suggested_bank = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id,
+            *base,
             BankTransaction.match_status == "suggested",
+        )
+    ) or 0
+    rejected_bank = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base,
+            BankTransaction.match_status == "rejected",
         )
     ) or 0
 
@@ -661,11 +709,303 @@ async def get_reconciliation_status(
         "matched_bank": confirmed_bank,
         "matched_provider": confirmed_provider,
         "confirmed_bank": confirmed_bank,
+        "motor_confirmed_bank": motor_confirmed,
+        "user_confirmed_bank": user_confirmed,
         "confirmed_provider": confirmed_provider,
         "suggested_bank": suggested_bank,
-        "pending_bank": max(0, bank_transactions - confirmed_bank - suggested_bank),
+        "rejected_bank": rejected_bank,
+        "pending_bank": max(
+            0, bank_transactions - confirmed_bank - suggested_bank - rejected_bank
+        ),
         "pending_provider": max(0, provider_transactions - confirmed_provider),
-        "auto_confirm_only": True,
+        "auto_confirm_only": False,
+        "policy": "motor_proposes; client confirms suggestions; signed-close seals a period",
+    }
+
+
+@router.post("/suggestions/{bank_tx_id}/confirm")
+async def confirm_suggestion(
+    bank_tx_id: int,
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Client validates a motor suggestion → user_confirmed (matched=1)."""
+    row = (
+        await db.execute(
+            select(BankTransaction).where(
+                BankTransaction.id == bank_tx_id,
+                BankTransaction.tenant_id == tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Bank transaction not found")
+    if row.match_status not in ("suggested", "pending"):
+        raise HTTPException(
+            400, f"Cannot confirm status={row.match_status}; expected suggested/pending"
+        )
+
+    ev: dict = {}
+    if row.match_evidence:
+        try:
+            ev = json.loads(row.match_evidence)
+        except Exception:
+            ev = {"prior": str(row.match_evidence)[:300]}
+    now = datetime.utcnow()
+    ev["decision"] = "user_confirmed"
+    ev["confirmed_by"] = "user"
+    ev["validated_by_user_id"] = str(getattr(current_user, "id", "") or "")
+    ev["validated_by_email"] = getattr(current_user, "email", None)
+    ev["validated_at"] = now.isoformat() + "Z"
+    ev["rules_fired"] = list(ev.get("rules_fired") or []) + ["user_confirmed_suggestion"]
+
+    row.matched = 1
+    row.match_status = "user_confirmed"
+    row.match_evidence = json.dumps(ev, ensure_ascii=False)
+    row.matched_at = now
+
+    # Promote linked provider legs if present
+    prov_ids = ev.get("provider_tx_ids") or (
+        [ev["provider_tx_id"]] if ev.get("provider_tx_id") is not None else []
+    )
+    for pid in prov_ids:
+        p = await db.get(ProviderTransaction, int(pid))
+        if p and p.tenant_id == tenant_id:
+            p.matched = 1
+            p.match_status = "user_confirmed"
+            p.match_evidence = row.match_evidence
+            p.matched_at = now
+            p.matched_bank_tx_id = bank_tx_id
+
+    await db.commit()
+    return {
+        "bank_tx_id": bank_tx_id,
+        "match_status": "user_confirmed",
+        "message": "Sugerencia confirmada por el cliente. Ya cuenta como validada.",
+        "evidence": ev,
+    }
+
+
+@router.post("/suggestions/{bank_tx_id}/reject")
+async def reject_suggestion(
+    bank_tx_id: int,
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """Client rejects a motor suggestion — stays unmatched, status=rejected."""
+    row = (
+        await db.execute(
+            select(BankTransaction).where(
+                BankTransaction.id == bank_tx_id,
+                BankTransaction.tenant_id == tenant_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if not row:
+        raise HTTPException(404, "Bank transaction not found")
+    if row.match_status not in ("suggested", "pending"):
+        raise HTTPException(
+            400, f"Cannot reject status={row.match_status}; expected suggested/pending"
+        )
+
+    ev: dict = {}
+    if row.match_evidence:
+        try:
+            ev = json.loads(row.match_evidence)
+        except Exception:
+            ev = {"prior": str(row.match_evidence)[:300]}
+    now = datetime.utcnow()
+    ev["decision"] = "rejected"
+    ev["rejected_by"] = "user"
+    ev["validated_by_user_id"] = str(getattr(current_user, "id", "") or "")
+    ev["validated_by_email"] = getattr(current_user, "email", None)
+    ev["rejected_at"] = now.isoformat() + "Z"
+    ev["rules_fired"] = list(ev.get("rules_fired") or []) + ["user_rejected_suggestion"]
+
+    row.matched = 0
+    row.match_status = "rejected"
+    row.match_evidence = json.dumps(ev, ensure_ascii=False)
+    row.matched_at = now
+
+    prov_ids = ev.get("provider_tx_ids") or (
+        [ev["provider_tx_id"]] if ev.get("provider_tx_id") is not None else []
+    )
+    for pid in prov_ids:
+        p = await db.get(ProviderTransaction, int(pid))
+        if p and p.tenant_id == tenant_id:
+            p.matched = 0
+            p.match_status = "rejected"
+            p.match_evidence = row.match_evidence
+            p.matched_at = now
+            p.matched_bank_tx_id = None
+
+    await db.commit()
+    return {
+        "bank_tx_id": bank_tx_id,
+        "match_status": "rejected",
+        "message": "Sugerencia rechazada. Queda documentada; no cuenta como confirmada.",
+        "evidence": ev,
+    }
+
+
+@router.post("/signed-close")
+async def signed_close(
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_db),
+    current_user: CurrentUser = Depends(get_current_user),
+    date_from: str = Query(..., description="YYYY-MM-DD"),
+    date_to: str = Query(..., description="YYYY-MM-DD"),
+    allow_open_items: bool = Query(
+        False,
+        description="If true, allow close with suggested/pending remaining",
+    ),
+    note: str | None = Query(None),
+):
+    """
+    Seal a period: snapshot motor vs user-validated counts.
+    Default: refuse if suggested/pending remain in the window.
+    """
+    import hashlib
+
+    df = _parse_optional_date(date_from)
+    dt = _parse_optional_date(date_to)
+    if not df or not dt:
+        raise HTTPException(422, "date_from and date_to required (YYYY-MM-DD)")
+    if df.date() > dt.date():
+        raise HTTPException(400, "date_from must be <= date_to")
+
+    base = [
+        BankTransaction.tenant_id == tenant_id,
+        BankTransaction.transaction_date >= df,
+        BankTransaction.transaction_date <= dt + timedelta(days=1) - timedelta(seconds=1),
+    ]
+
+    bank_total = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(*base)
+    ) or 0
+    motor_confirmed = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base, BankTransaction.match_status == "confirmed", BankTransaction.matched == 1
+        )
+    ) or 0
+    user_confirmed = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base, BankTransaction.match_status == "user_confirmed", BankTransaction.matched == 1
+        )
+    ) or 0
+    suggested = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base, BankTransaction.match_status == "suggested"
+        )
+    ) or 0
+    pending = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base,
+            or_(
+                BankTransaction.match_status == "pending",
+                BankTransaction.match_status.is_(None),
+            ),
+            BankTransaction.matched == 0,
+        )
+    ) or 0
+
+    if not allow_open_items and (suggested > 0 or pending > 0):
+        raise HTTPException(
+            409,
+            detail={
+                "message": (
+                    "Hay sugeridos o pendientes en el periodo. "
+                    "Confirmá/rechazá sugerencias o pass allow_open_items=true."
+                ),
+                "suggested": suggested,
+                "pending": pending,
+            },
+        )
+
+    snapshot = {
+        "engine": ENGINE,
+        "date_from": date_from,
+        "date_to": date_to,
+        "bank_total": bank_total,
+        "motor_confirmed": motor_confirmed,
+        "user_confirmed": user_confirmed,
+        "suggested_remaining": suggested,
+        "pending_remaining": pending,
+        "signed_by_email": getattr(current_user, "email", None),
+        "note": note,
+    }
+    blob = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
+    evidence_hash = hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    close = CashClose(
+        tenant_id=tenant_id,
+        date_from=df.date(),
+        date_to=dt.date(),
+        status="signed",
+        signed_by_user_id=str(getattr(current_user, "id", "") or ""),
+        signed_by_email=getattr(current_user, "email", None),
+        signed_at=datetime.utcnow(),
+        motor_confirmed=motor_confirmed,
+        user_confirmed=user_confirmed,
+        suggested_remaining=suggested,
+        pending_remaining=pending,
+        bank_total=bank_total,
+        allow_open_items=1 if allow_open_items else 0,
+        snapshot_json=blob,
+        evidence_hash=evidence_hash,
+        note=note,
+    )
+    db.add(close)
+    await db.commit()
+    await db.refresh(close)
+
+    return {
+        "id": close.id,
+        "status": "signed",
+        "evidence_hash": evidence_hash,
+        "snapshot": snapshot,
+        "disclaimer": (
+            "Cierre firmado por el usuario del tenant. "
+            "No sustituye auditoría externa ni certificación contable."
+        ),
+    }
+
+
+@router.get("/signed-closes")
+async def list_signed_closes(
+    tenant_id: uuid.UUID = Depends(resolve_tenant_id),
+    db: AsyncSession = Depends(get_db),
+    limit: int = Query(20, ge=1, le=100),
+):
+    rows = (
+        await db.execute(
+            select(CashClose)
+            .where(CashClose.tenant_id == tenant_id)
+            .order_by(CashClose.signed_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return {
+        "closes": [
+            {
+                "id": r.id,
+                "date_from": r.date_from.isoformat() if r.date_from else None,
+                "date_to": r.date_to.isoformat() if r.date_to else None,
+                "status": r.status,
+                "signed_by_email": r.signed_by_email,
+                "signed_at": r.signed_at.isoformat() if r.signed_at else None,
+                "motor_confirmed": r.motor_confirmed,
+                "user_confirmed": r.user_confirmed,
+                "suggested_remaining": r.suggested_remaining,
+                "pending_remaining": r.pending_remaining,
+                "bank_total": r.bank_total,
+                "evidence_hash": r.evidence_hash,
+                "note": r.note,
+            }
+            for r in rows
+        ]
     }
 
 
@@ -674,31 +1014,44 @@ async def trial_report(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
     db: AsyncSession = Depends(get_db),
     sample: int = Query(default=20, ge=1, le=100),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
 ):
-    """Pilot report: confirmed vs pending + sample evidence (any tenant)."""
+    """Pilot report: motor vs user-validated + sample evidence."""
+    df = _parse_optional_date(date_from)
+    dt = _parse_optional_date(date_to)
+    base = [BankTransaction.tenant_id == tenant_id, *(await _window_filters(df, dt))]
+
     bank_total = await db.scalar(
-        select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id
-        )
+        select(func.count()).select_from(BankTransaction).where(*base)
     ) or 0
     prov_total = await db.scalar(
         select(func.count()).select_from(ProviderTransaction).where(
             ProviderTransaction.tenant_id == tenant_id
         )
     ) or 0
-    confirmed_bank = await db.scalar(
+    motor_confirmed = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id,
-            BankTransaction.matched == 1,
+            *base, BankTransaction.match_status == "confirmed", BankTransaction.matched == 1
         )
     ) or 0
+    user_confirmed = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base, BankTransaction.match_status == "user_confirmed", BankTransaction.matched == 1
+        )
+    ) or 0
+    confirmed_bank = motor_confirmed + user_confirmed
     suggested_bank = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(
-            BankTransaction.tenant_id == tenant_id,
-            BankTransaction.match_status == "suggested",
+            *base, BankTransaction.match_status == "suggested"
         )
     ) or 0
-    pending_bank = max(0, bank_total - confirmed_bank - suggested_bank)
+    rejected_bank = await db.scalar(
+        select(func.count()).select_from(BankTransaction).where(
+            *base, BankTransaction.match_status == "rejected"
+        )
+    ) or 0
+    pending_bank = max(0, bank_total - confirmed_bank - suggested_bank - rejected_bank)
 
     confirmed_rows = (
         await db.execute(
@@ -712,8 +1065,10 @@ async def trial_report(
                 BankTransaction.match_status,
             )
             .where(
-                BankTransaction.tenant_id == tenant_id,
-                BankTransaction.match_status.in_(["confirmed", "suggested"]),
+                *base,
+                BankTransaction.match_status.in_(
+                    ["confirmed", "user_confirmed", "suggested", "rejected"]
+                ),
             )
             .order_by(BankTransaction.matched_at.desc().nullslast())
             .limit(sample)
@@ -752,7 +1107,8 @@ async def trial_report(
                 "provider_tx_ids": ev.get("provider_tx_ids"),
                 "provider_tx_id": ev.get("provider_tx_id"),
                 "day_diff": ev.get("day_diff"),
-                "confirmed_by": ev.get("confirmed_by"),
+                "confirmed_by": ev.get("confirmed_by") or ev.get("validated_by_email"),
+                "score": ev.get("score"),
                 "decision": ev.get("decision"),
             },
         })
@@ -761,15 +1117,21 @@ async def trial_report(
     return {
         "engine": ENGINE,
         "pilot": True,
+        "date_from": date_from,
+        "date_to": date_to,
         "disclaimer": (
-            "Propuesta del motor con evidencia guardada. "
-            "No es un cierre de caja firmado ni auditoría externa."
+            "Propuesta del motor vs validación del cliente. "
+            "Usá signed-close para sellar un periodo. "
+            "No es auditoría externa."
         ),
         "totals": {
             "bank": bank_total,
             "provider": prov_total,
             "confirmed_bank": confirmed_bank,
+            "motor_confirmed_bank": motor_confirmed,
+            "user_confirmed_bank": user_confirmed,
             "suggested_bank": suggested_bank,
+            "rejected_bank": rejected_bank,
             "pending_bank": pending_bank,
             "confirm_rate_pct": rate,
         },

@@ -13,6 +13,7 @@ class ReconJob(Base):
     tenant_id = Column(UUID, nullable=False, index=True)
     status = Column(String(32), nullable=False, default="queued", index=True)
     progress = Column(Integer, nullable=False, default=0)
+    params_json = Column(Text, nullable=True)  # date window / engine snapshot
     result_json = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now())

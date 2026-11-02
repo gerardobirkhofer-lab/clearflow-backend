@@ -2,13 +2,13 @@
 # Post-deploy health check for ClearFlow API (Railway).
 # Run outside restricted sandboxes — needs open network to Railway.
 #
-# Ops notes (pilot-ops-v1):
+# Ops notes (trust-close-v1):
 # - Health deploy tag must match main.py /health "deploy"
-# - Business routers use get_db (tenant-aware); keep get_shared_db for
-#   public callbacks/webhooks (OB callback, Stripe webhook) and meta tenants.
-# - Prod: CLEARFLOW_STRICT_SECRETS=1, real Twilio (no stub SMS codes),
-#   CORS allowlist, JWT secret not default, SMTP for outbox approve-send.
-# - After Railway deploy: ./scripts/verify_deploy_health.sh pilot-ops-v1
+# - Business routers use get_db; OB callback + Stripe webhook stay shared.
+# - Async recon jobs use tenant_db_manager (dedicated DB aware).
+# - Signed-close + suggestion confirm/reject are live.
+# - Prod: CLEARFLOW_STRICT_SECRETS=1, Twilio, CORS, JWT, SMTP.
+# - After Railway deploy: ./scripts/verify_deploy_health.sh trust-close-v1
 set -euo pipefail
 
 API_URL="${CLEARFLOW_API_URL:-https://clearflow-api-production.up.railway.app}"

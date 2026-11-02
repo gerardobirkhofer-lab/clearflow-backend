@@ -81,6 +81,8 @@ async def upgrade_tenant(
     tenant_id: UUID = Depends(get_current_tenant),
 ):
     """Upgrade or downgrade tenant tier and optionally set a dedicated DB URL."""
+    from ...core.database import tenant_db_manager
+
     tenant = await db.get(Tenant, tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -106,7 +108,6 @@ async def upgrade_tenant(
             tenant.database_name = data.database_name
     elif new_level < current_level:
         # Downgrading
-        from ...core.database import tenant_db_manager
         await tenant_db_manager.close_tenant(tenant_id)
         tenant.database_url = None
         tenant.database_name = None
@@ -114,7 +115,130 @@ async def upgrade_tenant(
     tenant.tier = data.tier
     await db.commit()
     await db.refresh(tenant)
+    # Invalidate URL cache so next request re-reads database_url and create_all
+    await tenant_db_manager.close_tenant(tenant_id)
+    if tenant.database_url:
+        await tenant_db_manager.get_session_maker(tenant_id)
     return tenant
+
+
+@router.post("/provision-db")
+async def provision_dedicated_db(
+    database_url: str,
+    database_name: str | None = None,
+    tier: str = "pro",
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(require_role(["owner", "admin"])),
+    tenant_id: UUID = Depends(get_current_tenant),
+):
+    """
+    Attach a dedicated Postgres URL, create business tables, smoke-test SELECT 1,
+    then set tier to pro/enterprise. Does not auto-create cloud DBs — you supply the URL.
+    """
+    from sqlalchemy import text
+    from ...core.database import tenant_db_manager
+
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+
+    tier_val = (tier or "pro").lower()
+    if tier_val not in ("pro", "enterprise"):
+        raise HTTPException(400, "tier must be pro or enterprise")
+    if not database_url or not database_url.strip():
+        raise HTTPException(400, "database_url is required")
+
+    tenant.database_url = database_url.strip()
+    tenant.database_name = database_name
+    tenant.tier = TenantTier.PRO if tier_val == "pro" else TenantTier.ENTERPRISE
+    await db.commit()
+    await db.refresh(tenant)
+
+    await tenant_db_manager.close_tenant(tenant_id)
+    try:
+        maker = await tenant_db_manager.get_session_maker(tenant_id)
+        async with maker() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        # Roll back URL so tenant stays usable on shared
+        tenant.database_url = None
+        tenant.database_name = None
+        tenant.tier = TenantTier.STARTER
+        await db.commit()
+        await tenant_db_manager.close_tenant(tenant_id)
+        raise HTTPException(
+            400,
+            detail=f"Dedicated DB unreachable or migrate failed: {exc}",
+        ) from exc
+
+    return {
+        "ok": True,
+        "tenant_id": str(tenant_id),
+        "tier": tenant.tier.value if hasattr(tenant.tier, "value") else str(tenant.tier),
+        "database_name": tenant.database_name,
+        "message": "Dedicated DB provisioned (create_all + SELECT 1). Business traffic will route here.",
+    }
+
+
+@router.post("/migrate")
+async def migrate_dedicated_db(
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(require_role(["owner", "admin"])),
+    tenant_id: UUID = Depends(get_current_tenant),
+):
+    """Re-run create_all on the tenant's dedicated DB (idempotent)."""
+    from ...core.database import tenant_db_manager
+
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    if not tenant.database_url:
+        raise HTTPException(400, "No dedicated database_url — call provision-db first")
+
+    await tenant_db_manager.close_tenant(tenant_id)
+    try:
+        await tenant_db_manager.get_session_maker(tenant_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, detail=f"migrate failed: {exc}") from exc
+
+    return {
+        "ok": True,
+        "tenant_id": str(tenant_id),
+        "message": "create_all completed on dedicated DB",
+    }
+
+
+@router.post("/activate")
+async def activate_dedicated_db(
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(require_role(["owner", "admin"])),
+    tenant_id: UUID = Depends(get_current_tenant),
+):
+    """
+    Confirm dedicated routing is live: cache warm + SELECT 1.
+    Call after provision-db / migrate.
+    """
+    from sqlalchemy import text
+    from ...core.database import tenant_db_manager
+
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    if not tenant.database_url:
+        raise HTTPException(400, "No dedicated database_url configured")
+
+    await tenant_db_manager.close_tenant(tenant_id)
+    maker = await tenant_db_manager.get_session_maker(tenant_id)
+    async with maker() as session:
+        await session.execute(text("SELECT 1"))
+
+    return {
+        "ok": True,
+        "tenant_id": str(tenant_id),
+        "tier": tenant.tier.value if hasattr(tenant.tier, "value") else str(tenant.tier),
+        "routing": "dedicated",
+        "message": "Dedicated DB active for this tenant",
+    }
 
 
 @router.put("/{tenant_id}", response_model=TenantResponse)

@@ -57,6 +57,7 @@ Base = declarative_base()
 from app.models import (  # noqa: F401
     bank_account,
     bank_transaction,
+    cash_close,
     dispute,
     dispute_email_log,
     email_outbox,

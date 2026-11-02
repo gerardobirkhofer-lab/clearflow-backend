@@ -33,6 +33,8 @@ async def run_control(
     run_detail: bool = True,
     run_reconstruct: bool = True,
     create_disputes: bool = True,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
 ) -> dict[str, Any]:
     out: dict[str, Any] = {
         "engine": CONTROL_ENGINE,
@@ -41,6 +43,8 @@ async def run_control(
             "Con detalle → Strategy Detail; sin detalle → Strategy Reconstruct. "
             "Siempre documentado."
         ),
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
         "detail": None,
         "reconstruct": None,
     }
@@ -48,11 +52,17 @@ async def run_control(
     if run_detail:
         from app.api.v1.reconciliation import execute_reconciliation
 
-        out["detail"] = await execute_reconciliation(db, tenant_id)
+        out["detail"] = await execute_reconciliation(
+            db, tenant_id, date_from=date_from, date_to=date_to
+        )
 
     if run_reconstruct:
         out["reconstruct"] = await _run_reconstruct(
-            db, tenant_id, create_disputes=create_disputes
+            db,
+            tenant_id,
+            create_disputes=create_disputes,
+            date_from=date_from,
+            date_to=date_to,
         )
 
     return out
@@ -63,6 +73,8 @@ async def _run_reconstruct(
     tenant_id: uuid.UUID,
     *,
     create_disputes: bool,
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
 ) -> dict[str, Any]:
     providers = (
         await db.execute(
@@ -88,28 +100,38 @@ async def _run_reconstruct(
             "hint": "Cargá fees y D+X del contrato en Setup / providers.",
         }
 
+    sale_filters = [
+        ProviderTransaction.tenant_id == tenant_id,
+        ProviderTransaction.matched == 0,
+        or_(
+            ProviderTransaction.match_status == "pending",
+            ProviderTransaction.match_status.is_(None),
+            ProviderTransaction.match_status == "suggested",
+        ),
+    ]
+    if date_from is not None:
+        sale_filters.append(ProviderTransaction.transaction_date >= date_from)
+    if date_to is not None:
+        sale_filters.append(ProviderTransaction.transaction_date <= date_to)
+
     # Unmatched provider legs = sales without detail-match
     sales = (
         await db.execute(
-            select(ProviderTransaction).where(
-                ProviderTransaction.tenant_id == tenant_id,
-                ProviderTransaction.matched == 0,
-                or_(
-                    ProviderTransaction.match_status == "pending",
-                    ProviderTransaction.match_status.is_(None),
-                    ProviderTransaction.match_status == "suggested",
-                ),
-            ).limit(3000)
+            select(ProviderTransaction).where(*sale_filters).limit(3000)
         )
     ).scalars().all()
 
+    bank_filters = [
+        BankTransaction.tenant_id == tenant_id,
+        BankTransaction.matched == 0,
+    ]
+    if date_from is not None:
+        bank_filters.append(BankTransaction.transaction_date >= date_from)
+    if date_to is not None:
+        bank_filters.append(BankTransaction.transaction_date <= date_to)
+
     unmatched_banks = (
-        await db.execute(
-            select(BankTransaction).where(
-                BankTransaction.tenant_id == tenant_id,
-                BankTransaction.matched == 0,
-            )
-        )
+        await db.execute(select(BankTransaction).where(*bank_filters))
     ).scalars().all()
     # Index bank by rounded amount for candidate lookup
     banks_by_amt: dict[float, list[BankTransaction]] = {}

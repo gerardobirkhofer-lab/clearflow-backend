@@ -29,11 +29,18 @@ def _row_to_dict(row: ReconJob) -> dict[str, Any]:
             result = json.loads(row.result_json)
         except Exception:
             result = {"raw": row.result_json[:500]}
+    params = None
+    if getattr(row, "params_json", None):
+        try:
+            params = json.loads(row.params_json)
+        except Exception:
+            params = {"raw": str(row.params_json)[:200]}
     return {
         "id": row.id,
         "tenant_id": str(row.tenant_id),
         "status": row.status,
         "progress": row.progress or 0,
+        "params": params,
         "created_at": row.created_at.isoformat() + "Z" if row.created_at else None,
         "updated_at": row.updated_at.isoformat() + "Z" if row.updated_at else None,
         "result": result,
@@ -41,8 +48,9 @@ def _row_to_dict(row: ReconJob) -> dict[str, Any]:
     }
 
 
-async def create_job(tenant_id: uuid.UUID) -> str:
+async def create_job(tenant_id: uuid.UUID, params: dict[str, Any] | None = None) -> str:
     job_id = str(uuid.uuid4())
+    params_json = json.dumps(params or {}, ensure_ascii=False)
     try:
         async with SharedSessionLocal() as db:
             db.add(
@@ -51,6 +59,7 @@ async def create_job(tenant_id: uuid.UUID) -> str:
                     tenant_id=tenant_id,
                     status="queued",
                     progress=0,
+                    params_json=params_json,
                 )
             )
             await db.commit()
@@ -61,6 +70,7 @@ async def create_job(tenant_id: uuid.UUID) -> str:
             "tenant_id": str(tenant_id),
             "status": "queued",
             "progress": 0,
+            "params": params or {},
             "created_at": _now(),
             "updated_at": _now(),
             "result": None,

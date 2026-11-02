@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, Query
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -18,6 +20,15 @@ from sqlalchemy import select
 router = APIRouter()
 
 
+def _parse_optional_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid date: {value}") from exc
+
+
 @router.post("/run")
 async def control_run(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
@@ -25,11 +36,14 @@ async def control_run(
     detail: bool = Query(default=True),
     reconstruct: bool = Query(default=True),
     create_disputes: bool = Query(default=True),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
 ):
     """
     One control run:
       1) Strategy Detail (line matching) if detail=true
       2) Strategy Reconstruct (contract math vs bank) on remaining gaps
+    Optional date window applies to both strategies.
     """
     result = await run_control(
         db,
@@ -37,6 +51,8 @@ async def control_run(
         run_detail=detail,
         run_reconstruct=reconstruct,
         create_disputes=create_disputes,
+        date_from=_parse_optional_date(date_from),
+        date_to=_parse_optional_date(date_to),
     )
     return result
 

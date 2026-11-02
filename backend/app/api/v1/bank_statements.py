@@ -280,11 +280,33 @@ async def list_transactions(
         le=1,
         description="Filter by match status: 0=unreconciled, 1=reconciled, omit=all",
     ),
+    date_from: str | None = Query(default=None, description="YYYY-MM-DD"),
+    date_to: str | None = Query(default=None, description="YYYY-MM-DD"),
+    match_status: str | None = Query(
+        default=None,
+        description="pending|suggested|confirmed|user_confirmed|rejected",
+    ),
 ):
     """Paginated bank movements. Default limit=50 keeps Payment Check under ~1s."""
     filters = [BankTransaction.tenant_id == tenant_id]
     if matched is not None:
         filters.append(BankTransaction.matched == matched)
+    if match_status:
+        filters.append(BankTransaction.match_status == match_status)
+    if date_from:
+        try:
+            filters.append(
+                BankTransaction.transaction_date >= datetime.fromisoformat(date_from)
+            )
+        except ValueError as exc:
+            raise HTTPException(422, f"Invalid date_from: {date_from}") from exc
+    if date_to:
+        try:
+            filters.append(
+                BankTransaction.transaction_date <= datetime.fromisoformat(date_to)
+            )
+        except ValueError as exc:
+            raise HTTPException(422, f"Invalid date_to: {date_to}") from exc
 
     total_count = await db.scalar(
         select(func.count()).select_from(BankTransaction).where(*filters)
