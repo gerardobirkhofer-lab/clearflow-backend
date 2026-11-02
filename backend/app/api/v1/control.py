@@ -8,7 +8,7 @@ import uuid
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_shared_db
+from app.core.database import get_db
 from app.core.tenant import resolve_tenant_id
 from app.services.control_orchestrator import CONTROL_ENGINE, run_control
 from app.services.contract_math import ContractTerms, expected_from_gross, gross_up_from_net
@@ -21,7 +21,7 @@ router = APIRouter()
 @router.post("/run")
 async def control_run(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     detail: bool = Query(default=True),
     reconstruct: bool = Query(default=True),
     create_disputes: bool = Query(default=True),
@@ -66,7 +66,7 @@ async def preview_contract_math(
     net: float | None = None,
     provider_name: str = "stripe",
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """Quick calculator from persisted contract terms (or defaults)."""
     result = await db.execute(

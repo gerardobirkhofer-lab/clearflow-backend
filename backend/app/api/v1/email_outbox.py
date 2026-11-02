@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_shared_db
+from app.core.database import get_db
 from app.core.email import get_email_service
 from app.core.tenant import assert_tenant_access
 from app.models.dispute_email_log import DisputeEmailLog
@@ -65,7 +65,7 @@ async def _get_item(
 async def list_outbox(
     tenant_id: uuid.UUID = Query(...),
     status: str | None = Query(None),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -89,7 +89,7 @@ async def list_outbox(
 async def get_outbox_item(
     item_id: int,
     tenant_id: uuid.UUID = Query(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -101,7 +101,7 @@ async def approve_and_send(
     item_id: int,
     tenant_id: uuid.UUID = Query(...),
     to_email: str | None = Query(None, description="Override recipient if missing"),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -172,7 +172,7 @@ async def approve_and_send(
 async def reject_draft(
     item_id: int,
     tenant_id: uuid.UUID = Query(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """Client declines to send. ClearFlow work is done; we do not interfere."""
@@ -196,7 +196,7 @@ async def reject_draft(
 async def cancel_draft(
     item_id: int,
     tenant_id: uuid.UUID = Query(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)

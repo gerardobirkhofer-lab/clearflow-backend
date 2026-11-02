@@ -21,7 +21,7 @@ from app.models.provider import Provider
 from app.models.provider_transaction import ProviderTransaction
 from app.services.contract_math import ContractTerms, fee_on_gross
 
-SALE_KINDS = {"sale_detail", "sale", "charge", "payment", ""}
+SALE_KINDS = {"sale_detail", "sale", "charge", "payment", "facturador_sale", ""}
 NON_SALE_HINTS = ("fee", "payout", "refund", "transfer", "adjustment")
 
 

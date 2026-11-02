@@ -17,7 +17,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import SharedSessionLocal, get_shared_db
+from app.core.database import SharedSessionLocal, get_db
 from app.core.tenant import resolve_tenant_id
 from app.models.bank_transaction import BankTransaction
 from app.models.dispute import Dispute
@@ -535,7 +535,7 @@ def _parse_optional_date(value: str | None) -> datetime | None:
 @router.post("/run")
 async def run_reconciliation(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
 ):
@@ -621,7 +621,7 @@ async def list_reconciliation_jobs(
 @router.get("/status")
 async def get_reconciliation_status(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
 ):
     """Counts: confirmed / suggested / pending."""
     bank_transactions = await db.scalar(
@@ -672,7 +672,7 @@ async def get_reconciliation_status(
 @router.get("/trial-report")
 async def trial_report(
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     sample: int = Query(default=20, ge=1, le=100),
 ):
     """Pilot report: confirmed vs pending + sample evidence (any tenant)."""

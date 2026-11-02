@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_shared_db
+from app.core.database import get_db
 from app.core.tenant import assert_tenant_access
 from app.models.tenant_document import TenantDocument
 from app.models.tenant_vault_settings import TenantVaultSettings
@@ -44,7 +44,7 @@ def _s3_cfg_from_settings(s: TenantVaultSettings) -> dict:
 @router.get("/storage-config")
 async def get_storage_config(
     tenant_id: uuid.UUID = Query(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -80,7 +80,7 @@ async def get_storage_config(
 @router.put("/storage-config")
 async def put_storage_config(
     payload: dict,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -132,7 +132,7 @@ async def upload_document(
     category: str = Form("other"),
     related_provider_name: str = Form(""),
     notes: str = Form(""),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -189,7 +189,7 @@ async def upload_document(
 async def list_documents(
     tenant_id: uuid.UUID = Query(...),
     category: str | None = Query(None),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -222,7 +222,7 @@ async def list_documents(
 async def download_document(
     doc_id: int,
     tenant_id: uuid.UUID = Query(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -261,7 +261,7 @@ async def download_document(
 async def soft_delete_document(
     doc_id: int,
     tenant_id: uuid.UUID = Query(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)

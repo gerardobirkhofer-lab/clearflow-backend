@@ -7,7 +7,7 @@ import io
 from datetime import datetime
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_db, get_shared_db
+from app.core.database import get_db
 from app.core.tenant import assert_tenant_access
 from app.models.provider_transaction import ProviderTransaction
 from app.models.provider import Provider
@@ -20,7 +20,7 @@ async def upload_provider_report(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
     provider_name: str = Form(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -232,7 +232,7 @@ async def upload_provider_report(
 @router.get("/")
 async def list_provider_transactions(
     tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
     limit: int = 200,
 ):
@@ -351,7 +351,7 @@ def _provider_public(p: Provider) -> dict:
 @router.get("/list")
 async def list_providers(
     tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """List all providers configured for a tenant (includes contract terms)."""
@@ -366,7 +366,7 @@ async def list_providers(
 @router.post("/contracts/sync")
 async def sync_provider_contracts(
     payload: dict,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -445,7 +445,7 @@ async def update_provider(
     fee_percent: float = None,
     fee_fixed: float = None,
     monthly_fee: float = None,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """Update provider settings (dispute email, fees, etc.)."""

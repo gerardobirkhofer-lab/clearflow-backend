@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_shared_db
+from app.core.database import get_db
 from app.core.tenant import assert_tenant_access
 from app.services.projection_service import pnl_projected_vs_actual, projected_cash_flow
 
@@ -21,7 +21,7 @@ router = APIRouter()
 async def get_projected_cash_flow(
     tenant_id: uuid.UUID = Query(...),
     horizon_days: int = Query(30, ge=1, le=90),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -39,7 +39,7 @@ async def get_pnl_projected_vs_actual(
     start_date: str | None = Query(None, description="YYYY-MM-DD"),
     end_date: str | None = Query(None, description="YYYY-MM-DD"),
     days: int = Query(30, ge=1, le=365),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)

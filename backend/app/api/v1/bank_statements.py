@@ -7,7 +7,7 @@ import io
 from datetime import datetime
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_shared_db
+from app.core.database import get_db
 from app.core.tenant import assert_tenant_access, resolve_tenant_id
 from app.models.bank_transaction import BankTransaction
 from app.models_orm import Tenant
@@ -32,7 +32,7 @@ def _tx_source(filename: str | None, bank_name: str | None = None) -> str:
 async def upload_statement(
     file: UploadFile = File(...),
     tenant_id: uuid.UUID = Form(...),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -270,7 +270,7 @@ def _parse_date(val):
 
 @router.get("/")
 async def list_transactions(
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
     limit: int = Query(default=50, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
@@ -344,7 +344,7 @@ async def list_transactions(
 
 @router.get("/dashboard")
 async def get_dashboard(
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     tenant_id: uuid.UUID = Depends(resolve_tenant_id),
 ):
     from app.models.provider_transaction import ProviderTransaction

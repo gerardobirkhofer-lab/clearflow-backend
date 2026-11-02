@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_shared_db
+from app.core.database import get_db, get_shared_db
 from app.core.tenant import assert_tenant_access
 from app.models.bank_account import BankAccount
 from app.models.bank_transaction import BankTransaction
@@ -122,7 +122,7 @@ async def list_institutions(country: str = Query(default="ES", min_length=2, max
 @router.post("/link")
 async def create_bank_link(
     body: CreateLinkRequest,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -213,9 +213,10 @@ async def open_banking_callback(
     db: AsyncSession = Depends(get_shared_db),
 ):
     """
-    Bank redirects here after consent.
+    Bank redirects here after consent (public — no JWT).
     - GoCardless: ?ref=<session_id>
     - Tink: ?code=...&state=cf:tenant:institution
+    Uses shared DB: callback has no authenticated user for tenant routing.
     """
     client = get_open_banking_client()
     provider_name = client.name
@@ -399,7 +400,7 @@ async def open_banking_callback(
 @router.get("/transactions/{tenant_id}")
 async def list_open_banking_transactions(
     tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
     limit: int = Query(default=200, ge=1, le=1000),
 ):
@@ -438,7 +439,7 @@ async def list_open_banking_transactions(
 @router.get("/connections/{tenant_id}")
 async def list_connections(
     tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tenant_id = assert_tenant_access(tenant_id, current_user)
@@ -489,7 +490,7 @@ async def list_connections(
 @router.post("/sync/{tenant_id}")
 async def sync_transactions(
     tenant_id: uuid.UUID,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
     days: int = Query(default=90, ge=1, le=365),
 ):

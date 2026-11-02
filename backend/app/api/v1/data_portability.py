@@ -19,7 +19,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import CurrentUser, get_current_user
-from app.core.database import get_shared_db
+from app.core.database import get_db
 from app.core.tenant import assert_tenant_access
 from app.models.bank_transaction import BankTransaction
 from app.models.provider_transaction import ProviderTransaction
@@ -81,7 +81,7 @@ async def export_tenant_data(
     tenant_id: uuid.UUID | None = Query(default=None),
     format: str = Query(default="json", pattern="^(json|csv)$"),
     limit: int = Query(default=5000, ge=1, le=20000),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
@@ -183,7 +183,7 @@ async def export_tenant_data(
 @router.get("/summary")
 async def data_summary(
     tenant_id: uuid.UUID | None = Query(default=None),
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     tid = assert_tenant_access(tenant_id, current_user)
@@ -214,7 +214,7 @@ async def data_summary(
 @router.post("/purge")
 async def purge_tenant_data(
     body: PurgeRequest,
-    db: AsyncSession = Depends(get_shared_db),
+    db: AsyncSession = Depends(get_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
     """
