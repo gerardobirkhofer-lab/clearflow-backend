@@ -52,6 +52,10 @@ async def get_current_user(
     except Exception:
         _unauthorized()
 
+    # MFA challenge tokens cannot access the API
+    if payload.get("purpose") == "mfa_pending":
+        _unauthorized()
+
     user_id = payload.get("sub") or payload.get("user_id")
     try:
         user_id_int = int(user_id)

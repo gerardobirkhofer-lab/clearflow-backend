@@ -211,6 +211,22 @@ async def init_db() -> None:
                       ON cf_local_users (tenant_id);
                   END IF;
 
+                  -- MFA columns on local auth users
+                  IF EXISTS (
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'cf_local_users'
+                  ) AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'cf_local_users'
+                      AND column_name = 'totp_enabled'
+                  ) THEN
+                    ALTER TABLE cf_local_users ADD COLUMN totp_secret VARCHAR(64);
+                    ALTER TABLE cf_local_users ADD COLUMN totp_enabled INTEGER DEFAULT 0;
+                    ALTER TABLE cf_local_users ADD COLUMN phone_e164 VARCHAR(32);
+                    ALTER TABLE cf_local_users ADD COLUMN sms_backup_enabled INTEGER DEFAULT 0;
+                  END IF;
+
                   -- Trust engine: match_status + evidence (auto-confirm without client clicks)
                   IF EXISTS (
                     SELECT 1 FROM information_schema.tables
