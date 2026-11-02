@@ -39,6 +39,8 @@ from .api.v1 import (
     open_banking,
     data_portability,
     control,
+    documents,
+    email_outbox,
 )
 
 logger = structlog.get_logger()
@@ -141,7 +143,7 @@ def create_app() -> FastAPI:
     # Health check
     @app.get("/health", tags=["system"])
     async def health_check():
-        return {"status": "healthy", "version": "1.0.0", "deploy": "projection-v1"}
+        return {"status": "healthy", "version": "1.0.0", "deploy": "vault-outbox-v1"}
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
@@ -156,6 +158,8 @@ def create_app() -> FastAPI:
     app.include_router(fee_structures.router, prefix="/api/v1", tags=["fee-structures"])
     app.include_router(reconciliation.router, prefix="/api/v1/reconciliation", tags=["reconciliation"])
     app.include_router(control.router, prefix="/api/v1/control", tags=["control"])
+    app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
+    app.include_router(email_outbox.router, prefix="/api/v1/email-outbox", tags=["email-outbox"])
     app.include_router(cash_flow.router, prefix="/api/v1", tags=["cash-flow"])
     app.include_router(morning_reports.router, prefix="/api/v1", tags=["morning-reports"])
     app.include_router(uploads.router, prefix="/api/v1", tags=["uploads"])

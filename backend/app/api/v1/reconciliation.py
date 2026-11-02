@@ -443,23 +443,42 @@ async def _open_contractual_disputes(
         expected = ev.get("contract_expected_net") or ev.get("contract_sum")
         bank_amt = ev.get("bank_amount")
         reason = ev.get("reject_reason") or "contractual_mismatch"
-        db.add(
-            Dispute(
-                tenant_id=tenant_id,
-                transaction_id=b.get("bank_id"),
-                provider_name=str(ev.get("provider_ref") or "provider")[:50],
-                dispute_type="contractual_discrepancy",
-                status="open",
-                amount=float(expected) if expected is not None else (float(bank_amt) if bank_amt is not None else 0),
-                description=(
-                    f"[Discrepancia Contractual] {reason} "
-                    f"bank_id={b.get('bank_id')} bank_amount={bank_amt} "
-                    f"contract_expected={expected} amount_diff={diff} "
-                    f"gateway_net={ev.get('gateway_reported_net')} "
-                    f"evidence={json.dumps(ev, ensure_ascii=False)[:1200]}"
-                ),
-                expected_resolution=now + timedelta(days=14),
-            )
+        amount_val = (
+            float(expected)
+            if expected is not None
+            else (float(bank_amt) if bank_amt is not None else 0)
+        )
+        desc = (
+            f"[Discrepancia Contractual] {reason} "
+            f"bank_id={b.get('bank_id')} bank_amount={bank_amt} "
+            f"contract_expected={expected} amount_diff={diff} "
+            f"gateway_net={ev.get('gateway_reported_net')} "
+            f"evidence={json.dumps(ev, ensure_ascii=False)[:1200]}"
+        )
+        dispute = Dispute(
+            tenant_id=tenant_id,
+            transaction_id=b.get("bank_id"),
+            provider_name=str(ev.get("provider_ref") or "provider")[:50],
+            dispute_type="contractual_discrepancy",
+            status="open",
+            amount=amount_val,
+            description=desc,
+            expected_resolution=now + timedelta(days=14),
+        )
+        db.add(dispute)
+        await db.flush()
+        # Draft email for client approval — never auto-send
+        from app.services.dispute_email_draft import enqueue_dispute_email_draft
+
+        await enqueue_dispute_email_draft(
+            db,
+            tenant_id=tenant_id,
+            dispute_id=dispute.id,
+            provider_name=dispute.provider_name or "provider",
+            dispute_type="contractual_discrepancy",
+            amount=amount_val,
+            description=desc,
+            meta={"bank_id": b.get("bank_id"), "reject_reason": reason},
         )
         # Mark provider legs if single
         pid = b.get("prov_id")
