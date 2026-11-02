@@ -118,8 +118,10 @@ async def send_sms(phone: str, message: str) -> dict[str, Any]:
                 return {"success": False, "error": res.text[:300], "provider": "twilio"}
             return {"success": True, "provider": "twilio"}
 
-    # Stub: allow MFA testing without Twilio
-    allow_stub = os.getenv("SMS_OTP_STUB", "1") == "1"
+    # Stub: only when explicitly enabled (default OFF in production)
+    env = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "").lower()
+    default_stub = "0" if env in ("production", "prod") else "1"
+    allow_stub = os.getenv("SMS_OTP_STUB", default_stub) == "1"
     if allow_stub:
         return {
             "success": True,

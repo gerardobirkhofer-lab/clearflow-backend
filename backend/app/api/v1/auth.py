@@ -458,3 +458,203 @@ async def sms_disable(current_user: CurrentUser = Depends(get_current_user)):
         user.phone_e164 = None
         await session.commit()
     return {"message": "SMS backup desactivado", "sms_backup_enabled": False}
+
+
+# ── Passkeys / WebAuthn (Face ID capable on platform authenticators) ─────────
+
+@router.get("/passkey/status")
+async def passkey_status(current_user: CurrentUser = Depends(get_current_user)):
+    from app.models.webauthn_credential import WebAuthnCredential
+    from app.services import webauthn_service as wa
+
+    async with SharedSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(WebAuthnCredential).where(
+                    WebAuthnCredential.user_id == int(current_user.id)
+                )
+            )
+        ).scalars().all()
+    return {
+        "available": wa.webauthn_available(),
+        "rp": wa.rp_config(),
+        "count": len(rows),
+        "credentials": [
+            {
+                "id": r.id,
+                "nickname": r.nickname,
+                "device_type": r.device_type,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+        "note": (
+            "Passkeys usan el autenticador del dispositivo (Face ID / Touch ID / Windows Hello) "
+            "como autenticación fuerte ante ClearFlow — distinto del Face ID solo para desbloquear el móvil."
+        ),
+    }
+
+
+@router.post("/passkey/register/begin")
+async def passkey_register_begin(current_user: CurrentUser = Depends(get_current_user)):
+    from app.models.webauthn_credential import WebAuthnCredential
+    from app.services import webauthn_service as wa
+
+    if not wa.webauthn_available():
+        raise HTTPException(status_code=503, detail="webauthn package not installed")
+    async with SharedSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(WebAuthnCredential).where(
+                    WebAuthnCredential.user_id == int(current_user.id)
+                )
+            )
+        ).scalars().all()
+    try:
+        from webauthn.helpers import base64url_to_bytes as _b64u
+
+        existing = []
+        for r in rows:
+            try:
+                existing.append(_b64u(r.credential_id))
+            except Exception:
+                continue
+        options = wa.begin_registration(
+            int(current_user.id),
+            current_user.email,
+            existing,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"publicKey": options, "rp": wa.rp_config()}
+
+
+@router.post("/passkey/register/complete")
+async def passkey_register_complete(
+    data: dict,
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    from app.models.webauthn_credential import WebAuthnCredential
+    from app.services import webauthn_service as wa
+    from webauthn.helpers import bytes_to_base64url
+
+    if not wa.webauthn_available():
+        raise HTTPException(status_code=503, detail="webauthn package not installed")
+    cred = data.get("credential") or data
+    try:
+        verified = wa.complete_registration(int(current_user.id), cred)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Passkey registration failed: {e}") from e
+
+    cid = bytes_to_base64url(verified["credential_id"])
+    async with SharedSessionLocal() as session:
+        row = WebAuthnCredential(
+            user_id=int(current_user.id),
+            tenant_id=current_user.tenant_id,
+            credential_id=cid,
+            public_key=verified["public_key"],
+            sign_count=verified["sign_count"],
+            device_type=(verified.get("credential_device_type") or "")[:32] or None,
+            backed_up=1 if verified.get("credential_backed_up") else 0,
+            nickname=(data.get("nickname") or "Passkey")[:100],
+        )
+        session.add(row)
+        await session.commit()
+    return {"message": "Passkey registrado. Puedes usarlo en el login (Face ID si el dispositivo lo soporta)."}
+
+
+@router.post("/passkey/login/begin")
+async def passkey_login_begin(data: dict):
+    from app.models.webauthn_credential import WebAuthnCredential
+    from app.services import webauthn_service as wa
+    from webauthn.helpers import base64url_to_bytes
+
+    if not wa.webauthn_available():
+        raise HTTPException(status_code=503, detail="webauthn package not installed")
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=422, detail="email required")
+    async with SharedSessionLocal() as session:
+        result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        rows = (
+            await session.execute(
+                select(WebAuthnCredential).where(WebAuthnCredential.user_id == user.id)
+            )
+        ).scalars().all()
+    if not rows:
+        raise HTTPException(status_code=400, detail="No passkeys enrolled for this account")
+    try:
+        options = wa.begin_authentication(
+            user.id,
+            [base64url_to_bytes(r.credential_id) for r in rows],
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"publicKey": options, "user_id": user.id}
+
+
+@router.post("/passkey/login/complete")
+async def passkey_login_complete(data: dict):
+    from datetime import datetime as dt
+    from app.models.webauthn_credential import WebAuthnCredential
+    from app.services import webauthn_service as wa
+    from webauthn.helpers import bytes_to_base64url, base64url_to_bytes
+
+    if not wa.webauthn_available():
+        raise HTTPException(status_code=503, detail="webauthn package not installed")
+    email = (data.get("email") or "").strip().lower()
+    cred = data.get("credential") or {}
+    if not email or not cred:
+        raise HTTPException(status_code=422, detail="email and credential required")
+
+    async with SharedSessionLocal() as session:
+        result = await session.execute(select(LocalAuthUser).where(LocalAuthUser.email == email))
+        user = result.scalar_one_or_none()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        raw_id = cred.get("rawId") or cred.get("id")
+        if isinstance(raw_id, str):
+            cid = raw_id if raw_id.startswith("ey") or "-" in raw_id or "_" in raw_id else raw_id
+            # browsers send base64url id
+            lookup = cid
+        else:
+            lookup = bytes_to_base64url(bytes(raw_id))
+        row = (
+            await session.execute(
+                select(WebAuthnCredential).where(
+                    WebAuthnCredential.user_id == user.id,
+                    WebAuthnCredential.credential_id == lookup,
+                )
+            )
+        ).scalar_one_or_none()
+        if not row:
+            # try normalize
+            rows = (
+                await session.execute(
+                    select(WebAuthnCredential).where(WebAuthnCredential.user_id == user.id)
+                )
+            ).scalars().all()
+            row = next((r for r in rows if r.credential_id == lookup), None)
+        if not row:
+            raise HTTPException(status_code=400, detail="Unknown passkey")
+        try:
+            new_count = wa.complete_authentication(
+                user.id,
+                cred,
+                public_key=row.public_key,
+                sign_count=int(row.sign_count or 0),
+            )
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Passkey verification failed: {e}") from e
+        row.sign_count = new_count
+        row.last_used_at = dt.utcnow()
+        await session.commit()
+        tenant_id = _as_uuid(user.tenant_id)
+        if tenant_id is None:
+            raise HTTPException(status_code=400, detail="Account missing tenant")
+
+    token = _create_access_token(user.id, user.email, tenant_id)
+    return {"token": token, "user": _user_out(user), "auth_method": "passkey"}

@@ -1,6 +1,5 @@
 """
-Tenant document vault — ClearFlow-hosted default (local filesystem).
-BYO cloud is a preference stub; connection comes later.
+Tenant document vault — ClearFlow local default + BYO S3-compatible.
 """
 from __future__ import annotations
 
@@ -8,6 +7,7 @@ import hashlib
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 
 VAULT_ROOT = Path(
     os.getenv("CLEARFLOW_VAULT_DIR")
@@ -33,10 +33,24 @@ def store_bytes(
     filename: str,
     data: bytes,
     category: str = "other",
+    backend: str = "clearflow_local",
+    s3_cfg: dict[str, Any] | None = None,
 ) -> dict:
     safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in (filename or "file"))[:180]
     key_name = f"{uuid.uuid4().hex}_{safe}"
     rel_key = f"{tenant_id}/{category}/{key_name}"
+    checksum = hashlib.sha256(data).hexdigest()
+
+    if backend == "s3":
+        _s3_put(rel_key, data, s3_cfg or {})
+        return {
+            "storage_backend": "s3",
+            "storage_key": rel_key,
+            "absolute_path": None,
+            "size_bytes": len(data),
+            "checksum_sha256": checksum,
+        }
+
     dest = ensure_vault_root() / str(tenant_id) / category
     dest.mkdir(parents=True, exist_ok=True)
     path = dest / key_name
@@ -46,13 +60,12 @@ def store_bytes(
         "storage_key": rel_key,
         "absolute_path": str(path),
         "size_bytes": len(data),
-        "checksum_sha256": hashlib.sha256(data).hexdigest(),
+        "checksum_sha256": checksum,
     }
 
 
 def resolve_path(storage_key: str) -> Path:
     path = ensure_vault_root() / storage_key
-    # Prevent path traversal
     root = ensure_vault_root().resolve()
     resolved = path.resolve()
     if not str(resolved).startswith(str(root)):
@@ -60,5 +73,59 @@ def resolve_path(storage_key: str) -> Path:
     return resolved
 
 
-def read_bytes(storage_key: str) -> bytes:
+def read_bytes(
+    storage_key: str,
+    *,
+    backend: str = "clearflow_local",
+    s3_cfg: dict[str, Any] | None = None,
+) -> bytes:
+    if backend == "s3":
+        return _s3_get(storage_key, s3_cfg or {})
     return resolve_path(storage_key).read_bytes()
+
+
+def _minio_client(cfg: dict[str, Any]):
+    try:
+        from minio import Minio
+    except ImportError as e:
+        raise RuntimeError(
+            "minio package required for BYO S3. Add minio to dependencies."
+        ) from e
+    endpoint = (cfg.get("endpoint") or "").replace("https://", "").replace("http://", "")
+    secure = str(cfg.get("secure", True)).lower() != "false"
+    if "://" in (cfg.get("endpoint") or ""):
+        secure = (cfg.get("endpoint") or "").startswith("https")
+    return Minio(
+        endpoint,
+        access_key=cfg["access_key"],
+        secret_key=cfg["secret_key"],
+        secure=secure,
+        region=cfg.get("region") or None,
+    )
+
+
+def _s3_put(key: str, data: bytes, cfg: dict[str, Any]) -> None:
+    from io import BytesIO
+
+    client = _minio_client(cfg)
+    bucket = cfg["bucket"]
+    found = client.bucket_exists(bucket)
+    if not found:
+        client.make_bucket(bucket, location=cfg.get("region") or None)
+    client.put_object(
+        bucket,
+        key,
+        BytesIO(data),
+        length=len(data),
+        content_type="application/octet-stream",
+    )
+
+
+def _s3_get(key: str, cfg: dict[str, Any]) -> bytes:
+    client = _minio_client(cfg)
+    resp = client.get_object(cfg["bucket"], key)
+    try:
+        return resp.read()
+    finally:
+        resp.close()
+        resp.release_conn()

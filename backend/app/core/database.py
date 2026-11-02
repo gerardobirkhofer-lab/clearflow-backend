@@ -66,6 +66,8 @@ from app.models import (  # noqa: F401
     provider_transaction,
     recon_job,
     tenant_document,
+    tenant_vault_settings,
+    webauthn_credential,
     user,
     local_auth_user,
 )
@@ -126,6 +128,15 @@ class TenantDBManager:
                 pool_pre_ping=True,
             )
             self._engines[tenant_id] = engine
+            # Ensure business tables exist on the dedicated database
+            try:
+                async with engine.begin() as conn:
+                    await conn.run_sync(lambda c: Base.metadata.create_all(c, checkfirst=True))
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "dedicated DB create_all failed for %s: %s", tenant_id, e
+                )
 
         maker = async_sessionmaker(
             engine,
@@ -161,8 +172,13 @@ tenant_db_manager = TenantDBManager(shared_engine)
 async def get_db(
     current_user: CurrentUser = Depends(get_current_user),
 ) -> AsyncGenerator[AsyncSession, None]:
-    """Yield an AsyncSession from the shared DB (demo mode)."""
-    async with SharedSessionLocal() as session:
+    """
+    Yield a tenant-aware AsyncSession.
+    Starter → shared DB (row filter by tenant_id).
+    Pro/Enterprise with database_url → dedicated engine.
+    """
+    maker = await tenant_db_manager.get_session_maker(current_user.tenant_id)
+    async with maker() as session:
         yield session
 
 

@@ -1,4 +1,4 @@
-"""Tenant document vault API — ClearFlow-hosted default; BYO stub."""
+"""Tenant document vault API — ClearFlow-hosted default; BYO S3-compatible."""
 from __future__ import annotations
 
 import uuid
@@ -13,38 +13,115 @@ from app.core.auth import CurrentUser, get_current_user
 from app.core.database import get_shared_db
 from app.core.tenant import assert_tenant_access
 from app.models.tenant_document import TenantDocument
-from app.services import vault_storage
+from app.models.tenant_vault_settings import TenantVaultSettings
+from app.services import secret_box, vault_storage
 
 router = APIRouter()
 
-MAX_BYTES = 15 * 1024 * 1024  # 15 MB
+MAX_BYTES = 15 * 1024 * 1024
+
+
+async def _vault_settings(
+    db: AsyncSession, tenant_id: uuid.UUID
+) -> TenantVaultSettings | None:
+    row = await db.execute(
+        select(TenantVaultSettings).where(TenantVaultSettings.tenant_id == tenant_id)
+    )
+    return row.scalar_one_or_none()
+
+
+def _s3_cfg_from_settings(s: TenantVaultSettings) -> dict:
+    return {
+        "endpoint": s.s3_endpoint,
+        "bucket": s.s3_bucket,
+        "region": s.s3_region or "eu-west-1",
+        "access_key": secret_box.decrypt_str(s.s3_access_key_enc),
+        "secret_key": secret_box.decrypt_str(s.s3_secret_key_enc),
+        "secure": True,
+    }
 
 
 @router.get("/storage-config")
 async def get_storage_config(
     tenant_id: uuid.UUID = Query(...),
+    db: AsyncSession = Depends(get_shared_db),
     current_user: CurrentUser = Depends(get_current_user),
 ):
-    assert_tenant_access(tenant_id, current_user)
-    # Preference is client-side for now; API documents the policy
+    tenant_id = assert_tenant_access(tenant_id, current_user)
+    s = await _vault_settings(db, tenant_id)
+    backend = (s.backend if s else "clearflow_local")
     return {
-        "choice": "clearflow",
+        "choice": "byo" if backend == "s3" else "clearflow",
+        "backend": backend,
+        "s3": {
+            "endpoint": s.s3_endpoint if s else None,
+            "bucket": s.s3_bucket if s else None,
+            "region": s.s3_region if s else None,
+            "configured": bool(s and s.s3_access_key_enc and s.s3_bucket),
+        }
+        if s
+        else None,
         "backends": {
             "clearflow": {
                 "available": True,
                 "label": "Vault ClearFlow",
-                "note": "Almacén cifrado por tenant, incluido en el plan. Recomendado para empezar.",
+                "note": "Almacén por tenant incluido. Recomendado para empezar.",
             },
             "byo": {
-                "available": False,
-                "status": "stub",
-                "label": "Tu propia nube",
-                "note": (
-                    "Puedes conectar S3 / Azure / GCS / Drive más adelante. "
-                    "No hace falta contratar nada extra para arrancar."
-                ),
+                "available": True,
+                "status": "s3_compatible",
+                "label": "Tu propia nube (S3 / MinIO / R2 / GCS S3 API)",
+                "note": "Tú controlas el bucket. ClearFlow solo lee/escribe documentos del tenant.",
             },
         },
+    }
+
+
+@router.put("/storage-config")
+async def put_storage_config(
+    payload: dict,
+    db: AsyncSession = Depends(get_shared_db),
+    current_user: CurrentUser = Depends(get_current_user),
+):
+    """
+    Body: {
+      tenant_id, backend: clearflow_local|s3,
+      s3_endpoint?, s3_bucket?, s3_region?,
+      s3_access_key?, s3_secret_key?
+    }
+    """
+    raw_tid = payload.get("tenant_id")
+    if not raw_tid:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    tenant_id = assert_tenant_access(uuid.UUID(str(raw_tid)), current_user)
+    backend = (payload.get("backend") or "clearflow_local").strip()
+    if backend not in ("clearflow_local", "s3"):
+        raise HTTPException(status_code=400, detail="backend must be clearflow_local or s3")
+
+    s = await _vault_settings(db, tenant_id)
+    if not s:
+        s = TenantVaultSettings(tenant_id=tenant_id)
+        db.add(s)
+
+    s.backend = backend
+    if backend == "s3":
+        s.s3_endpoint = (payload.get("s3_endpoint") or "").strip() or None
+        s.s3_bucket = (payload.get("s3_bucket") or "").strip() or None
+        s.s3_region = (payload.get("s3_region") or "eu-west-1").strip()
+        if payload.get("s3_access_key"):
+            s.s3_access_key_enc = secret_box.encrypt_str(str(payload["s3_access_key"]))
+        if payload.get("s3_secret_key"):
+            s.s3_secret_key_enc = secret_box.encrypt_str(str(payload["s3_secret_key"]))
+        if not s.s3_endpoint or not s.s3_bucket or not s.s3_access_key_enc:
+            raise HTTPException(
+                status_code=400,
+                detail="s3_endpoint, s3_bucket and s3_access_key required for BYO",
+            )
+    await db.commit()
+    return {
+        "message": "Vault storage preference saved",
+        "backend": s.backend,
+        "choice": "byo" if s.backend == "s3" else "clearflow",
     }
 
 
@@ -66,12 +143,21 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="File too large (max 15MB)")
 
     cat = (category or "other").strip().lower()[:40]
-    stored = vault_storage.store_bytes(
-        tenant_id,
-        filename=file.filename or "document",
-        data=data,
-        category=cat,
-    )
+    settings = await _vault_settings(db, tenant_id)
+    backend = settings.backend if settings else "clearflow_local"
+    s3_cfg = _s3_cfg_from_settings(settings) if backend == "s3" and settings else None
+    try:
+        stored = vault_storage.store_bytes(
+            tenant_id,
+            filename=file.filename or "document",
+            data=data,
+            category=cat,
+            backend=backend,
+            s3_cfg=s3_cfg,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Vault write failed: {e}") from e
+
     doc = TenantDocument(
         tenant_id=tenant_id,
         category=cat,
@@ -95,7 +181,7 @@ async def upload_document(
         "storage_backend": doc.storage_backend,
         "related_provider_name": doc.related_provider_name,
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
-        "message": "Documento guardado en el vault ClearFlow del tenant.",
+        "message": "Documento guardado en el vault del tenant.",
     }
 
 
@@ -150,8 +236,16 @@ async def download_document(
     doc = row.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+    settings = await _vault_settings(db, tenant_id)
+    s3_cfg = (
+        _s3_cfg_from_settings(settings)
+        if doc.storage_backend == "s3" and settings
+        else None
+    )
     try:
-        data = vault_storage.read_bytes(doc.storage_key)
+        data = vault_storage.read_bytes(
+            doc.storage_key, backend=doc.storage_backend, s3_cfg=s3_cfg
+        )
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"File missing: {e}") from e
     return Response(
