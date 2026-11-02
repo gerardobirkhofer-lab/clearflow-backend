@@ -281,8 +281,14 @@ async def mfa_sms_send(data: dict):
         "phone_masked": _mask_phone(phone),
         "provider": send.get("provider"),
     }
-    if send.get("provider") == "stub":
-        out["stub_code"] = code  # only when SMS stub enabled — remove in strict prod
+    # Never return OTP in API body in production; stub_code only if stub + DEBUG
+    if (
+        send.get("provider") == "stub"
+        and os.getenv("SMS_OTP_STUB") == "1"
+        and os.getenv("ENVIRONMENT", "").lower() not in ("production", "prod")
+        and os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+    ):
+        out["stub_code"] = code
         out["note"] = send.get("note")
     return out
 
@@ -416,7 +422,12 @@ async def sms_setup(
         "phone_masked": _mask_phone(phone),
         "provider": send.get("provider"),
     }
-    if send.get("provider") == "stub":
+    if (
+        send.get("provider") == "stub"
+        and os.getenv("SMS_OTP_STUB") == "1"
+        and os.getenv("ENVIRONMENT", "").lower() not in ("production", "prod")
+        and os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+    ):
         out["stub_code"] = code
     return out
 

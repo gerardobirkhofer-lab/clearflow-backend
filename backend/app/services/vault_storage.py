@@ -27,6 +27,32 @@ def tenant_dir(tenant_id: str | uuid.UUID) -> Path:
     return d
 
 
+def clearflow_hosted_s3_cfg() -> dict[str, Any] | None:
+    """Platform-managed durable vault (MinIO/S3) when env is set."""
+    endpoint = os.getenv("CLEARFLOW_VAULT_S3_ENDPOINT") or os.getenv("MINIO_ENDPOINT") or ""
+    bucket = os.getenv("CLEARFLOW_VAULT_S3_BUCKET") or os.getenv("MINIO_BUCKET_NAME") or ""
+    access = os.getenv("CLEARFLOW_VAULT_S3_ACCESS_KEY") or os.getenv("MINIO_ACCESS_KEY") or ""
+    secret = os.getenv("CLEARFLOW_VAULT_S3_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY") or ""
+    region = os.getenv("CLEARFLOW_VAULT_S3_REGION") or "eu-west-1"
+    # Skip obvious local docker demo defaults unless explicitly forced
+    if not endpoint or not bucket or not access or not secret:
+        return None
+    if (
+        access == "minioadmin"
+        and secret == "minioadmin"
+        and os.getenv("CLEARFLOW_VAULT_ALLOW_DEMO_MINIO", "0") != "1"
+    ):
+        return None
+    return {
+        "endpoint": endpoint,
+        "bucket": bucket,
+        "region": region,
+        "access_key": access,
+        "secret_key": secret,
+        "secure": os.getenv("CLEARFLOW_VAULT_S3_SECURE", "true").lower() != "false",
+    }
+
+
 def store_bytes(
     tenant_id: str | uuid.UUID,
     *,
@@ -40,6 +66,13 @@ def store_bytes(
     key_name = f"{uuid.uuid4().hex}_{safe}"
     rel_key = f"{tenant_id}/{category}/{key_name}"
     checksum = hashlib.sha256(data).hexdigest()
+
+    # Prefer durable platform S3 for "clearflow_local" when configured
+    if backend == "clearflow_local":
+        hosted = clearflow_hosted_s3_cfg()
+        if hosted:
+            backend = "s3"
+            s3_cfg = hosted
 
     if backend == "s3":
         _s3_put(rel_key, data, s3_cfg or {})

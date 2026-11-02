@@ -53,6 +53,27 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     settings = get_settings()
     logger.info("app_starting", environment=settings.ENVIRONMENT)
 
+    # Production secret hygiene
+    jwt_key = os.getenv("JWT_SECRET_KEY", "")
+    weak = (
+        not jwt_key
+        or jwt_key in (
+            "clearflow-secret-key-change-in-production",
+            "change-me-in-production",
+            "dev-secret-key",
+        )
+        or settings.SECRET_KEY in ("change-me-in-production", "dev-secret-key")
+    )
+    if settings.ENVIRONMENT.lower() in ("production", "prod") and weak:
+        logger.error(
+            "insecure_jwt_secret",
+            msg="JWT_SECRET_KEY/SECRET_KEY is missing or default — rotate immediately",
+        )
+        if os.getenv("CLEARFLOW_STRICT_SECRETS", "0") == "1":
+            raise RuntimeError(
+                "Refusing to start: set a strong JWT_SECRET_KEY (CLEARFLOW_STRICT_SECRETS=1)"
+            )
+
     # Initialize database (create tables if they don't exist)
     try:
         await init_db()
@@ -87,7 +108,7 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if True else None,
         lifespan=lifespan,
     )
-    # CORS
+    # CORS — explicit allowlist only (no wildcard with credentials)
     frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
     allow_origins = [
         "http://localhost:3000",
@@ -96,15 +117,23 @@ def create_app() -> FastAPI:
         "https://clearflow-frontend-rust.vercel.app",
         "https://clearflow-frontend-vbzt.onrender.com",
     ]
+    extra = (settings.CORS_ORIGINS or os.getenv("CORS_ORIGINS") or "").strip()
+    if extra and extra != "*":
+        for o in extra.split(","):
+            o = o.strip()
+            if o and o not in allow_origins:
+                allow_origins.append(o)
     if frontend_url and frontend_url not in allow_origins:
         allow_origins.append(frontend_url)
+    if settings.ENVIRONMENT.lower() in ("production", "prod"):
+        allow_origins = [o for o in allow_origins if not o.startswith("http://localhost")]
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allow_origins,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
     )
 
     # Request logging middleware
@@ -143,7 +172,7 @@ def create_app() -> FastAPI:
     # Health check
     @app.get("/health", tags=["system"])
     async def health_check():
-        return {"status": "healthy", "version": "1.0.0", "deploy": "tenant-isolation-v1"}
+        return {"status": "healthy", "version": "1.0.0", "deploy": "sec-harden-v1"}
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])

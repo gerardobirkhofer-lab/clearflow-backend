@@ -118,14 +118,18 @@ async def send_sms(phone: str, message: str) -> dict[str, Any]:
                 return {"success": False, "error": res.text[:300], "provider": "twilio"}
             return {"success": True, "provider": "twilio"}
 
-    # Stub: only when explicitly enabled (default OFF in production)
+    # Stub: NEVER in production. Dev only when SMS_OTP_STUB=1 explicitly.
     env = (os.getenv("ENVIRONMENT") or os.getenv("ENV") or "").lower()
-    default_stub = "0" if env in ("production", "prod") else "1"
-    allow_stub = os.getenv("SMS_OTP_STUB", default_stub) == "1"
-    if allow_stub:
+    if env in ("production", "prod"):
+        return {
+            "success": False,
+            "error": "SMS provider not configured (Twilio required in production)",
+            "provider": "none",
+        }
+    if os.getenv("SMS_OTP_STUB", "0") == "1":
         return {
             "success": True,
             "provider": "stub",
-            "note": "SMS stub activo (SMS_OTP_STUB=1). Configura Twilio en producción.",
+            "note": "Dev SMS stub only. Set TWILIO_* for real delivery.",
         }
     return {"success": False, "error": "SMS provider not configured", "provider": "none"}
