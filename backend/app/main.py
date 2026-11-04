@@ -36,6 +36,7 @@ from .api.v1 import (
     webhooks,
     dashboard,
     stripe_connect,
+    api_stripe,
     open_banking,
     data_portability,
     control,
@@ -173,7 +174,7 @@ def create_app() -> FastAPI:
     # Health check
     @app.get("/health", tags=["system"])
     async def health_check():
-        return {"status": "healthy", "version": "1.0.0", "deploy": "trust-close-v1"}
+        return {"status": "healthy", "version": "1.0.0", "deploy": "self-serve-v1"}
 
     # Include all API routers
     app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
@@ -197,6 +198,7 @@ def create_app() -> FastAPI:
     app.include_router(webhooks.router, prefix="/api/v1", tags=["webhooks"])
     app.include_router(dashboard.router, prefix="/api/v1", tags=["dashboard"])
     app.include_router(stripe_connect.router, prefix="/api/v1/stripe", tags=["stripe"])
+    app.include_router(api_stripe.router, prefix="/api/v1", tags=["billing"])
     app.include_router(open_banking.router, prefix="/api/v1", tags=["open-banking"])
 
     return app

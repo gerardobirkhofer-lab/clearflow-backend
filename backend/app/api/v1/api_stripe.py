@@ -5,12 +5,18 @@ from typing import Optional, Dict, Any, List
 import os
 import stripe
 
-router = APIRouter(prefix="/stripe", tags=["stripe"])
+# ClearFlow *billing* (our SaaS subscriptions) — not Stripe Connect for merchants.
+router = APIRouter(prefix="/billing", tags=["billing"])
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+# Optional defaults from env (Stripe Dashboard → Products → Price IDs)
+STRIPE_PRICE_STARTER = os.getenv("STRIPE_PRICE_STARTER", "")
+STRIPE_PRICE_PRO = os.getenv("STRIPE_PRICE_PRO", "")
+STRIPE_PRICE_ENTERPRISE = os.getenv("STRIPE_PRICE_ENTERPRISE", "")
+TRIAL_DAYS = int(os.getenv("STRIPE_TRIAL_DAYS", "14"))
 
 if STRIPE_SECRET_KEY:
     stripe.api_key = STRIPE_SECRET_KEY
@@ -18,11 +24,14 @@ if STRIPE_SECRET_KEY:
 
 class CreateCheckoutSessionRequest(BaseModel):
     price_id: Optional[str] = None
-    mode: str = Field(default="payment")
+    plan: Optional[str] = None  # starter | pro | enterprise → resolves env price id
+    mode: str = Field(default="subscription")
     customer_email: Optional[str] = None
     customer_id: Optional[str] = None
     line_items: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, str]] = Field(default_factory=dict)
+    trial_days: Optional[int] = None
+    tenant_id: Optional[str] = None
 
 
 class CreateCustomerRequest(BaseModel):
@@ -38,14 +47,57 @@ def get_stripe_config():
     return {"publishableKey": STRIPE_PUBLISHABLE_KEY}
 
 
+def _resolve_price_id(body: CreateCheckoutSessionRequest) -> str | None:
+    if body.price_id:
+        return body.price_id
+    plan = (body.plan or "").strip().lower()
+    mapping = {
+        "starter": STRIPE_PRICE_STARTER,
+        "pro": STRIPE_PRICE_PRO,
+        "enterprise": STRIPE_PRICE_ENTERPRISE,
+    }
+    return mapping.get(plan) or None
+
+
+@router.get("/plans")
+def list_billing_plans():
+    """Public: which plans are wired (price ids present) + trial length."""
+    return {
+        "trial_days": TRIAL_DAYS,
+        "currency_note": "Set amounts in Stripe Dashboard; ClearFlow only stores Price IDs.",
+        "plans": {
+            "starter": {"price_id_configured": bool(STRIPE_PRICE_STARTER), "label": "Starter"},
+            "pro": {"price_id_configured": bool(STRIPE_PRICE_PRO), "label": "Pro"},
+            "enterprise": {
+                "price_id_configured": bool(STRIPE_PRICE_ENTERPRISE),
+                "label": "Enterprise",
+            },
+        },
+        "checkout": "/api/v1/billing/checkout-sessions",
+    }
+
+
 @router.post("/checkout-sessions", status_code=status.HTTP_201_CREATED)
 def create_checkout_session(body: CreateCheckoutSessionRequest):
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Billing not configured (STRIPE_SECRET_KEY missing)",
+        )
     try:
-        params = {
+        price_id = _resolve_price_id(body)
+        meta = dict(body.metadata or {})
+        if body.tenant_id:
+            meta["tenant_id"] = body.tenant_id
+        if body.plan:
+            meta["plan"] = body.plan
+
+        params: Dict[str, Any] = {
             "mode": body.mode,
-            "success_url": f"{FRONTEND_URL}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
-            "cancel_url": f"{FRONTEND_URL}/payment/cancel",
-            "metadata": body.metadata or {},
+            "success_url": f"{FRONTEND_URL}/payment-success?session_id={{CHECKOUT_SESSION_ID}}",
+            "cancel_url": f"{FRONTEND_URL}/payment-cancel",
+            "metadata": meta,
+            "allow_promotion_codes": True,
         }
         if body.customer_id:
             params["customer"] = body.customer_id
@@ -53,12 +105,33 @@ def create_checkout_session(body: CreateCheckoutSessionRequest):
             params["customer_email"] = body.customer_email
         if body.line_items:
             params["line_items"] = body.line_items
-        elif body.price_id:
-            params["line_items"] = [{"price": body.price_id, "quantity": 1}]
+        elif price_id:
+            params["line_items"] = [{"price": price_id, "quantity": 1}]
         else:
-            raise HTTPException(status_code=400, detail="Either price_id or line_items must be provided")
+            raise HTTPException(
+                status_code=400,
+                detail="Provide price_id or plan=starter|pro|enterprise (and set STRIPE_PRICE_* env)",
+            )
+
+        # Self-serve trial on subscriptions
+        if body.mode == "subscription":
+            days = body.trial_days if body.trial_days is not None else TRIAL_DAYS
+            if days and days > 0:
+                params["subscription_data"] = {
+                    "trial_period_days": int(days),
+                    "metadata": meta,
+                }
+
         session = stripe.checkout.Session.create(**params)
-        return {"id": session.id, "url": session.url, "status": session.status, "mode": session.mode}
+        return {
+            "id": session.id,
+            "url": session.url,
+            "status": session.status,
+            "mode": session.mode,
+            "trial_days": (body.trial_days if body.trial_days is not None else TRIAL_DAYS)
+            if body.mode == "subscription"
+            else 0,
+        }
     except stripe.error.StripeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
