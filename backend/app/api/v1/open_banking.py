@@ -1,7 +1,7 @@
 """
 Open Banking endpoints (multi-provider tube).
 
-Active vendor: OPEN_BANKING_PROVIDER=gocardless|truelayer|tink
+Active vendor: OPEN_BANKING_PROVIDER=tink|gocardless|truelayer (default: tink)
 
 Flow:
   1. GET  /institutions?country=ES

@@ -2,7 +2,7 @@
 Open Banking multi-provider tube.
 
 Select active vendor with:
-  OPEN_BANKING_PROVIDER=gocardless|truelayer|tink   (default: gocardless)
+  OPEN_BANKING_PROVIDER=tink|gocardless|truelayer   (default: tink)
 
 Each adapter keeps its own credentials. The HTTP API stays the same.
 """
@@ -60,8 +60,8 @@ def available_providers() -> list[dict[str, object]]:
 
 
 def get_active_provider_name() -> str:
-    raw = (os.getenv("OPEN_BANKING_PROVIDER") or "gocardless").strip().lower()
-    return raw or "gocardless"
+    raw = (os.getenv("OPEN_BANKING_PROVIDER") or "tink").strip().lower()
+    return raw or "tink"
 
 
 def get_open_banking_client(provider: str | None = None) -> OpenBankingProvider:
